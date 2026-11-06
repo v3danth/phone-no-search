@@ -96,8 +96,6 @@ Limits, which numverify shares:
   use.** 6362… and 6363… both pass.
 - **Carrier and state are the original allocation.** People can keep their
   number when they switch carriers (MNP), so the current carrier may differ.
-- **No owner details.** This tool reports facts about the number, not the
-  person.
 
 ## Research notes
 
@@ -127,8 +125,19 @@ matches all 22 without using the numverify rows (18 before
 libphonenumber), and the circle matches 16; the rest show "India".
 
 Possible next steps:
-- Fill the remaining ~14,000 blocks with no data; DoT letters listed
-  without a PDF are the main gap.
+- Fill the remaining blocks with no data. Most empty ones are probably
+  unallocated (6x, 71xx, prefixes that start with an STD code); about 250
+  are real gaps. DoT letters listed without a PDF are the main source
+  still missing (RTI to DoT Access Services Wing).
+- TODO: add the consolidated DoT "MSC and SP codes" lists on Scribd:
+  as on 30.06.2014 (87 pages,
+  https://www.scribd.com/document/340595713/Msc-Code-All-Operator) and
+  as on 31.12.2010
+  (https://www.scribd.com/doc/53690984/MSC-and-SP-Codes-as-on-31-12-10).
+  Scribd's viewer scrambles the text (font substitution), so do not
+  scrape it: download while signed in with a password (Google SSO
+  failed), or use screenshots of the pages, then extract like the DoT
+  letters into data/in_mobile_msc.csv with the list's date.
 - Add a `--country IN` default so bare 10-digit numbers work.
 - Add an optional HLR provider for the current carrier and live status.
 - Add a small web UI.
@@ -136,18 +145,7 @@ Possible next steps:
 ## Legal and data rules
 
 - **Do not use leaked or breached data** (for example the 2021 Domino's
-  India leak), and do not scrape personal details such as names or
-  addresses. Linking numbers to people without consent is a privacy harm
-  and likely illegal in India.
-- **DPDP Act 2023** (Digital Personal Data Protection Act): India's data
-  protection law. It requires consent and purpose limitation for personal
-  data, gives people rights to access, correct and erase their data, and
-  is enforced by the Data Protection Board with fines up to ₹250 crore.
-  The DPDP Rules were notified in Nov 2025 and phase in through about
-  2027. Number-level facts (prefix, circle, carrier) are not personal data.
-  If you store lookup history, you need a privacy notice and a deletion
-  policy.
-- **IT Act 2000**: covers unauthorised access and dealing in stolen data.
+  India leak).
 - **Data licences**: `data/in_mobile_series.csv` is CC BY-SA 4.0
   (Wikipedia and hstsethi/in-mob-prefix). Credit the sources if you share
   it.
@@ -173,6 +171,7 @@ maintenance and incident steps.
     data/in_libphonenumber_history.csv  libphonenumber carriers by date
     data/wiki_series_history.csv        Wikipedia 4-digit table by month, 2009-
     data/in_mob_prefix_history.csv      in-mob-prefix by commit
+    data/coai_msc.csv         COAI metro-circle MSC listing (undated)
     data/numverify_checks.csv numverify answers for checked blocks
     data/dot_msc/             the DoT letters (PDF) and their index
     data/README.md            data sources, licence, refresh steps
@@ -181,6 +180,7 @@ maintenance and incident steps.
     scripts/msc_withdrawals.py add withdrawals implied by DoT corrigenda
     scripts/libphonenumber_history.py  rebuild libphonenumber history
     scripts/series_history.py rebuild Wikipedia / in-mob-prefix history
+    scripts/coai_msc.py       extract COAI's MSC table
     scripts/check_blocks.py   check blocks against numverify/Veriphone
 
 ## Sources

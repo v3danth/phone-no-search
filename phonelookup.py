@@ -32,6 +32,7 @@ SERIES_CSV = ROOT / "data" / "in_mobile_series.csv"
 BLOCKS_CSV = ROOT / "data" / "in_mobile_blocks.csv"
 MSC_CSV = ROOT / "data" / "in_mobile_msc.csv"
 LIBPN_CSV = ROOT / "data" / "in_libphonenumber_history.csv"
+COAI_CSV = ROOT / "data" / "coai_msc.csv"
 # Dated histories of the two 4-digit sources (scripts/series_history.py).
 SERIES_HISTORY_CSV = {
     "wikipedia": ROOT / "data" / "wiki_series_history.csv",
@@ -311,14 +312,28 @@ def series_entries(series: dict) -> list:
     return earlier + [current]
 
 
+@lru_cache(maxsize=1)
+def coai_table() -> dict:
+    """5-digit block -> COAI's metro-circle MSC listing (undated, ~2016-17)."""
+    return read_table(COAI_CSV, "block")
+
+
+def coai_entry(row: dict) -> dict:
+    """Spell out a COAI row as an undated history entry."""
+    return {"carrier": operator_name(row["operator"]),
+            "location": expand_codes(row["circle"], IN_CIRCLES),
+            "source": "coai.com", "updated": "", "kind": "listed"}
+
+
 def india_mobile_history(national: str) -> list:
     """Return what the sources know about a 10-digit Indian mobile, with
     the entry to trust last.
 
     Dated entries (DoT letters, libphonenumber's git history, blocks-file
     rows) are sorted by date, so a reused or corrected block ends on its
-    newest owner. The coarser 4-digit series row (with its source's earlier
-    values, oldest first) goes first as the baseline whatever its date, or last when the newest dated entry is a closed operator, a
+    newest owner. Undated or coarse entries go first as the baseline
+    whatever their date: the 4-digit series row (with its source's earlier
+    values, oldest first), then COAI's undated 5-digit metro listing, or last when the newest dated entry is a closed operator, a
     withdrawal or a removal and the series row names a current operator,
     because it names who serves those numbers now.
 
@@ -334,8 +349,14 @@ def india_mobile_history(national: str) -> list:
     dated.sort(key=lambda entry: entry["updated"])
     series = series_table().get(national[:4])
     undated = series_entries(series) if series else []
+    coai = coai_table().get(national[:5])
+    if coai:  # 5-digit, so it outranks the 4-digit row
+        undated.append(coai_entry(coai))
     if dated and not is_current(dated[-1]) and any(map(is_current, undated)):
-        return dated + undated
+        # Keep the order, but end on a current operator: a closed one in an
+        # undated source must not become the answer over a current one.
+        return (dated + [e for e in undated if not is_current(e)]
+                + [e for e in undated if is_current(e)])
     return undated + dated
 
 
@@ -385,11 +406,16 @@ def india_overrides(result: dict, national: str) -> dict:
 def unallocated_note(national: str) -> str:
     """Explain a valid mobile number that no source gives an operator.
 
-    The 6x series (opened 2017) and 71xx (first letters 2026) are mostly
-    not handed out yet; numverify and Veriphone also return no carrier
-    there (checked 66980, 64460, 66666, 71679 on 2026-11-06).
+    Likely unallocated: the 6x series (opened 2017) and 71xx (first
+    letters 2026), and 4-digit prefixes where no block has any source.
+    Many of those start with a city's STD code (8161 = 0816 Tumkur, 8321 =
+    0832 Panaji); numverify reads them as landlines and Veriphone has no
+    carrier (checked 2026-11-06/07).
     """
-    if national[0] == "6" or national[:2] == "71":
+    whole_prefix_empty = not any(
+        india_mobile_history(national[:4] + digit + national[5:])
+        for digit in "0123456789")
+    if national[0] == "6" or national[:2] == "71" or whole_prefix_empty:
         return ("no operator in DoT letters, libphonenumber or numverify; "
                 "this block is probably not allocated yet")
     return "no operator known for this block"

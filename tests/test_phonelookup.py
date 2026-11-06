@@ -89,13 +89,21 @@ MSC_HEADER = "block,operator,circle,date,kind,letter,note\n"
 
 class UnallocatedTest(unittest.TestCase):
     def test_valid_mobile_with_no_source_gets_a_note(self):
+        known = [{"carrier": "Bharti Airtel", "location": "", "source": "x",
+                  "updated": "", "kind": "listed"}]
+
+        def neighbours_known(national):
+            return [] if national == "9999912345" else known
+
         with mock.patch.object(phonelookup, "india_mobile_history", return_value=[]):
             six = phonelookup.lookup("916698012345")
-            other = phonelookup.lookup("919999912345")
+            empty_prefix = phonelookup.lookup("919999912345")
+        with mock.patch.object(phonelookup, "india_mobile_history", side_effect=neighbours_known):
+            gap = phonelookup.lookup("919999912345")
         self.assertTrue(six["valid"])
         self.assertIn("probably not allocated", six["note"])
-        self.assertEqual(other.get("note", "no operator known for this block"),
-                         "no operator known for this block")
+        self.assertIn("probably not allocated", empty_prefix["note"])
+        self.assertEqual(gap["note"], "no operator known for this block")
 
 
 class HistoryTest(unittest.TestCase):
@@ -109,6 +117,7 @@ class HistoryTest(unittest.TestCase):
         use_table(self, "MSC_CSV", phonelookup.msc_table, MSC_HEADER)
         use_table(self, "BLOCKS_CSV", phonelookup.block_table,
                   "prefix,operator,circle,source,updated,note\n")
+        use_table(self, "COAI_CSV", phonelookup.coai_table, "block,operator,circle,listed_as\n")
 
     def test_block_override_wins_and_history_keeps_both(self):
         use_table(self, "BLOCKS_CSV", phonelookup.block_table,
@@ -159,6 +168,17 @@ class HistoryTest(unittest.TestCase):
             result = phonelookup.lookup(IN_SERIES)
         self.assertEqual((result["carrier"], result["location"]), ("Bharti Airtel", "Assam"))
         self.assertEqual(result["series_source"], "libphonenumber")
+
+    def test_closed_undated_source_never_beats_current_one(self):
+        # Newest dated entry is closed; COAI (undated) names a closed one
+        # too, the series table a current one: the series table answers.
+        use_table(self, "MSC_CSV", phonelookup.msc_table, MSC_HEADER +
+                  "74104,Aircel,RJ,2012-05-16,allocation,u1,\n")
+        use_table(self, "COAI_CSV", phonelookup.coai_table,
+                  "block,operator,circle,listed_as\n74104,RCom,MU,Reliance\n")
+        result = phonelookup.lookup(IN_SERIES)
+        self.assertEqual(result["carrier"], "Vodafone Idea (Vi)")
+        self.assertEqual(result["series_source"], "wikipedia")
 
     def test_withdrawal_is_not_the_answer(self):
         use_table(self, "MSC_CSV", phonelookup.msc_table, MSC_HEADER +

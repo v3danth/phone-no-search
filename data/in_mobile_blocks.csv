@@ -6,3 +6,4 @@ prefix,operator,circle,source,updated,note
 83176,RJ,AP,numverify,2026-11-06,block check with a made-up number (data/numverify_checks.csv)
 83177,VI,BR,numverify,2026-11-06,block check with a made-up number (data/numverify_checks.csv)
 83178,VI,WB,numverify,2026-11-06,block check with a made-up number (data/numverify_checks.csv)
+83610,AT,UE,numverify,2026-11-07,block check with a made-up number (data/numverify_checks.csv); not in DoT letters or libphonenumber

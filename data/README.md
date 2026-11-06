@@ -109,6 +109,15 @@ shape) and `git clone https://github.com/hstsethi/in-mob-prefix`, then
     python3 scripts/series_history.py wiki snapshots.json > data/wiki_series_history.csv
     python3 scripts/series_history.py git in-mob-prefix > data/in_mob_prefix_history.csv
 
+## coai_msc.csv
+
+MSC codes for the four metro circles (Mumbai, Kolkata, Delhi, Chennai)
+from https://coai.com/msc-codes, the operators' association (fetched
+2026-11-07, `scripts/coai_msc.py`). Undated; the operators listed place it
+around 2016-17. 1,814 blocks; 125 blocks the page lists under two
+operators or cities are left out. Used as an undated 5-digit source
+(above the 4-digit table, below anything dated), mainly for circles.
+
 ## How the sources combine
 
 For each number the lookup collects the dated entries — DoT letter rows,
