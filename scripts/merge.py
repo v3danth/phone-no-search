@@ -1,16 +1,67 @@
-import csv, re, sys
-def load(p): return {r["series"]: (r["operator"], r["circle"]) for r in csv.DictReader(open(p))}
-def clean(v):
-    parts = [p for p in dict.fromkeys(v.split("/")) if re.fullmatch(r"[A-Z]{2}", p)]
-    return "/".join(parts)
-w, g = load(sys.argv[1]), load(sys.argv[2])
-out = csv.writer(sys.stdout)
-out.writerow(["series", "operator", "circle", "source"])
-for k in sorted(set(w) | set(g)):
-    wo, wc = map(clean, w.get(k, ("", "")))
-    go, gc = map(clean, g.get(k, ("", "")))
-    if wo and wc: row = (wo, wc, "wikipedia")
-    elif go and gc: row = (go, gc, "in-mob-prefix")
-    elif wo or wc or go or gc: row = (wo or go, wc or gc, "partial")
-    else: continue
-    out.writerow([k, *row])
+#!/usr/bin/env python3
+"""Merge two series CSVs into data/in_mobile_series.csv.
+
+Usage: merge.py wiki_series.csv in_mob_prefix.csv > data/in_mobile_series.csv
+
+Wikipedia is preferred because it matched numverify where the sources
+disagreed; in-mob-prefix fills series Wikipedia lacks. See data/README.md.
+"""
+
+import csv
+import re
+import sys
+
+CODE = re.compile(r"[A-Z]{2}")
+EMPTY = ("", "")
+
+
+def load_series(path: str) -> dict:
+    """Read a series,operator,circle CSV into {series: (operator, circle)}."""
+    with open(path, encoding="utf-8", newline="") as fh:
+        return {row["series"]: (row["operator"], row["circle"])
+                for row in csv.DictReader(fh)}
+
+
+def clean_codes(value: str) -> str:
+    """Keep only 2-letter codes, de-duplicated, in their original order.
+
+    Source tables mix in notes and repeat circles for split blocks
+    ("BR/WB/BR"); the lookup tool only understands the codes.
+    """
+    codes = dict.fromkeys(value.split("/"))
+    return "/".join(code for code in codes if CODE.fullmatch(code))
+
+
+def merged_row(wiki: tuple, fallback: tuple):
+    """Pick (operator, circle, source) for one series, or None if unknown.
+
+    A complete Wikipedia entry wins, then a complete fallback entry, then
+    whatever partial values either source has.
+    """
+    wiki_op, wiki_circle = map(clean_codes, wiki)
+    fb_op, fb_circle = map(clean_codes, fallback)
+    if wiki_op and wiki_circle:
+        return wiki_op, wiki_circle, "wikipedia"
+    if fb_op and fb_circle:
+        return fb_op, fb_circle, "in-mob-prefix"
+    if wiki_op or wiki_circle or fb_op or fb_circle:
+        return wiki_op or fb_op, wiki_circle or fb_circle, "partial"
+    return None
+
+
+def main() -> int:
+    if len(sys.argv) != 3:
+        print(__doc__.strip().splitlines()[2], file=sys.stderr)
+        return 2
+    wiki, fallback = load_series(sys.argv[1]), load_series(sys.argv[2])
+    writer = csv.writer(sys.stdout)
+    writer.writerow(["series", "operator", "circle", "source"])
+    for series in sorted(wiki.keys() | fallback.keys()):
+        row = merged_row(wiki.get(series, EMPTY), fallback.get(series, EMPTY))
+        if row:
+            writer.writerow([series, *row])
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

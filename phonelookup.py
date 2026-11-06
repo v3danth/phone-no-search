@@ -81,48 +81,87 @@ IN_CIRCLES = {
 }
 
 
-def expand(codes: str, names: dict) -> str:
-    """'BR/WB' -> 'Bihar & Jharkhand / West Bengal' (split blocks)."""
+def expand_codes(codes: str, names: dict) -> str:
+    """Spell out short codes such as 'BR/WB'.
+
+    The series table stores operator and circle as 2-letter codes, with a
+    slash where DoT split a 4-digit block between circles.
+    """
     return " / ".join(names[c] for c in codes.split("/") if c in names)
 
 
 @lru_cache(maxsize=1)
-def in_series() -> dict:
-    """4-digit Indian mobile prefix -> (operator, circle, source)."""
+def series_table() -> dict:
+    """Map each 4-digit Indian mobile prefix to (operator, circle, source).
+
+    Cached because every Indian lookup needs it and the CSV never changes
+    while the process runs. A missing file yields an empty table so the
+    tool still works on libphonenumber data alone.
+    """
     try:
         with SERIES_CSV.open(encoding="utf-8") as fh:
             return {
-                r["series"]: (r["operator"], r["circle"], r["source"])
-                for r in csv.DictReader(fh)
+                row["series"]: (row["operator"], row["circle"], row["source"])
+                for row in csv.DictReader(fh)
             }
     except FileNotFoundError:
         return {}
 
 
-def india_mobile_info(national: str) -> dict:
-    """Operator and circle for a 10-digit Indian mobile, or {} if unknown."""
+def india_mobile_series(national: str) -> dict:
+    """Return carrier, location and source for a 10-digit Indian mobile.
+
+    libphonenumber has no state data for Indian mobiles, so this fills the
+    gap from the series table. Returns {} when the number is not a mobile
+    or its prefix is not in the table.
+    """
     if len(national) != 10 or national[0] not in "6789":
         return {}
-    match = in_series().get(national[:4])
+    match = series_table().get(national[:4])
     if not match:
         return {}
-    op, circle, source = match
+    operator, circle, source = match
     return {
-        "carrier": expand(op, IN_OPERATORS),
-        "location": expand(circle, IN_CIRCLES),
+        "carrier": expand_codes(operator, IN_OPERATORS),
+        "location": expand_codes(circle, IN_CIRCLES),
         "series_source": source,
     }
 
 
-def parse(raw: str):
+def india_overrides(result: dict, national: str) -> dict:
+    """Return the fields that replace libphonenumber's answer for India.
+
+    The series table is more specific than libphonenumber for Indian
+    mobiles, and stops 7x/8x mobiles being geocoded as STD landlines.
+    """
+    series = india_mobile_series(national)
+    if series:
+        return {
+            "line_type": "mobile",
+            "location": series["location"] or result["location"],
+            "carrier": series["carrier"] or result["carrier"],
+            "series_source": series["series_source"],
+        }
+    if result["line_type"] == "landline_or_mobile":
+        return {"location": result["country_name"]}
+    return {}
+
+
+def parse_number(raw: str) -> phonenumbers.PhoneNumber:
+    """Parse a number that already includes its country code.
+
+    Users paste numbers like 91XXXXXXXXXX without the '+'. Adding it stops
+    libphonenumber guessing a region from the leading digits.
+    """
     text = raw.strip()
     return phonenumbers.parse(text if text.startswith("+") else "+" + text, None)
 
 
 def lookup(raw: str) -> dict:
+    """Return numverify-style facts about one number, worked out offline."""
     digits = raw.strip()
     try:
-        num = parse(digits)
+        num = parse_number(digits)
     except phonenumbers.NumberParseException as err:
         return {"valid": False, "number": digits, "error": str(err)}
 
@@ -146,23 +185,17 @@ def lookup(raw: str) -> dict:
         "carrier": carrier.name_for_number(num, "en"),
         "line_type": LINE_TYPES.get(phonenumbers.number_type(num), "unknown"),
     }
-
     if region == "IN":
-        info = india_mobile_info(national)
-        if info:
-            # The series table is more specific than libphonenumber for Indian
-            # mobiles, and stops 7x/8x mobiles being geocoded as STD landlines.
-            result["line_type"] = "mobile"
-            result["location"] = info["location"] or result["location"]
-            result["carrier"] = info["carrier"] or result["carrier"]
-            result["series_source"] = info["series_source"]
-        elif result["line_type"] == "landline_or_mobile":
-            result["location"] = result["country_name"]
+        return {**result, **india_overrides(result, national)}
     return result
 
 
 def env_setting(name: str) -> str:
-    """Read a setting from the environment, falling back to ./.env."""
+    """Read a setting from the environment, falling back to ./.env.
+
+    Lets users keep the API key in a git-ignored file instead of their
+    shell history.
+    """
     if os.environ.get(name):
         return os.environ[name]
     try:
@@ -176,59 +209,81 @@ def env_setting(name: str) -> str:
 
 
 def numverify(number: str, key: str) -> dict:
-    """Call numverify's validate endpoint; errors come back as a dict."""
+    """Call numverify's validate endpoint.
+
+    Failures come back as {"error": ...} so one bad request does not stop
+    a batch of lookups.
+    """
     url = env_setting("NUMVERIFY_URL") or NUMVERIFY_URL
     query = urlencode({"access_key": key, "number": number})
     try:
         with urlopen(f"{url}?{query}", timeout=10) as resp:
-            data = json.load(resp)
+            body = json.load(resp)
     except HTTPError as err:  # apilayer puts the reason in the JSON body
         try:
-            data = json.load(err)
+            body = json.load(err)
         except ValueError:
             return {"error": f"request failed: {err}"}
     except (URLError, TimeoutError, ValueError) as err:
         return {"error": f"request failed: {err}"}
-    if data.get("success") is False:
-        info = data.get("error", {})
-        return {"error": info.get("info") or info.get("type") or "unknown error"}
-    return data
+    if body.get("success") is False:
+        error = body.get("error", {})
+        return {"error": error.get("info") or error.get("type") or "unknown error"}
+    return body
 
 
-def compare(ours: dict, theirs: dict) -> dict:
-    """Which shared fields agree between the offline and numverify results."""
-    def norm(v):
-        return str(v or "").lower()
+def normalized(value) -> str:
+    """Lower-cased text, with None and "" treated alike."""
+    return str(value or "").lower()
+
+
+def agreement(ours: dict, theirs: dict) -> dict:
+    """Report which shared fields match between offline and numverify.
+
+    Location matches when numverify's (often shorter) name appears in ours;
+    carrier matches on the first word, since the two sources spell brand
+    names differently ("Reliance Jio" vs "Reliance Jio Infocomm").
+    """
+    their_location = normalized(theirs.get("location"))
+    their_carrier = normalized(theirs.get("carrier")).split()[:1]
     return {
         "valid": ours.get("valid") == theirs.get("valid"),
-        "line_type": norm(ours.get("line_type")) == norm(theirs.get("line_type")),
-        "location": bool(theirs.get("location"))
-        and norm(theirs["location"]) in norm(ours.get("location")),
-        "carrier": bool(theirs.get("carrier"))
-        and norm(ours.get("carrier")).split()[:1] == norm(theirs["carrier"]).split()[:1],
+        "line_type": normalized(ours.get("line_type")) == normalized(theirs.get("line_type")),
+        "location": bool(their_location)
+        and their_location in normalized(ours.get("location")),
+        "carrier": bool(their_carrier)
+        and normalized(ours.get("carrier")).split()[:1] == their_carrier,
     }
 
 
 def dork(raw: str) -> str:
-    """Google query matching the common written forms of one number."""
-    num = parse(raw)
+    """Build a Google query matching the common written forms of one number.
+
+    The same number is written many ways online, so an exact-phrase search
+    for one form misses most pages.
+    """
+    num = parse_number(raw)
     cc, nat = str(num.country_code), str(num.national_number)
     forms = {
         nat,
-        f"+{cc}{nat}",
         f"{cc}{nat}",
+        f"+{cc}{nat}",
+        f"+{cc}-{nat}",
+        f"+{cc} {nat}",
         phonenumbers.format_number(num, PhoneNumberFormat.INTERNATIONAL),
         phonenumbers.format_number(num, PhoneNumberFormat.NATIONAL),
     }
-    forms |= {f"+{cc}-{nat}", f"+{cc} {nat}"}
     if cc == "91" and len(nat) == 10:
         forms.add(f"{nat[:5]} {nat[5:]}")
     elif cc == "1" and len(nat) == 10:
         forms.add(f"{nat[:3]}-{nat[3:6]}-{nat[6:]}")
-    return " OR ".join(f'"{f}"' for f in sorted(forms, key=len))
+    # Sort on the text too: sets have no order, and equal-length forms
+    # would otherwise print in a different order on each run.
+    return " OR ".join(f'"{f}"' for f in sorted(forms, key=lambda f: (len(f), f)))
 
 
-def main() -> int:
+def build_parser() -> argparse.ArgumentParser:
+    """Define the command-line flags."""
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("numbers", nargs="*")
     parser.add_argument("--file", help="file with one number per line")
@@ -237,6 +292,49 @@ def main() -> int:
                         help="print a Google search string and URL instead")
     parser.add_argument("--numverify", action="store_true",
                         help="also query numverify (uses 1 API request per number)")
+    return parser
+
+
+def input_numbers(args: argparse.Namespace) -> list:
+    """Collect numbers from arguments, then --file, then piped stdin.
+
+    Raises OSError if --file cannot be read.
+    """
+    numbers = list(args.numbers)
+    if args.file:
+        with open(args.file, encoding="utf-8") as fh:
+            numbers += fh.read().split()
+    if not numbers and not sys.stdin.isatty():
+        numbers = sys.stdin.read().split()
+    return numbers
+
+
+def print_dorks(numbers: list) -> None:
+    """Print a search query and URL per number; skip unparsable ones."""
+    for raw in numbers:
+        try:
+            query = dork(raw)
+        except phonenumbers.NumberParseException as err:
+            print(f"{raw}: {err}", file=sys.stderr)
+            continue
+        print(query)
+        print("https://www.google.com/search?q=" + quote_plus(query))
+
+
+def print_lookups(numbers: list, key: str, indent) -> None:
+    """Print one JSON result per number, adding numverify when key is set."""
+    for raw in numbers:
+        result = lookup(raw)
+        if key and result["valid"]:
+            remote = numverify(result["number"], key)
+            result = {"offline": result, "numverify": remote}
+            if "error" not in remote:
+                result["agree"] = agreement(result["offline"], remote)
+        print(json.dumps(result, indent=indent, ensure_ascii=False))
+
+
+def main() -> int:
+    parser = build_parser()
     args = parser.parse_args()
 
     key = ""
@@ -247,36 +345,19 @@ def main() -> int:
                   file=sys.stderr)
             return 2
 
-    numbers = list(args.numbers)
-    if args.file:
-        with open(args.file, encoding="utf-8") as fh:
-            numbers += fh.read().split()
-    if not numbers and not sys.stdin.isatty():
-        numbers = sys.stdin.read().split()
+    try:
+        numbers = input_numbers(args)
+    except OSError as err:
+        print(f"cannot read --file: {err}", file=sys.stderr)
+        return 2
     if not numbers:
         parser.print_help()
         return 2
 
     if args.dork:
-        for raw in numbers:
-            try:
-                query = dork(raw)
-            except phonenumbers.NumberParseException as err:
-                print(f"{raw}: {err}", file=sys.stderr)
-                continue
-            print(query)
-            print("https://www.google.com/search?q=" + quote_plus(query))
-        return 0
-
-    indent = 2 if args.pretty else None
-    for raw in numbers:
-        result = lookup(raw)
-        if args.numverify and result["valid"]:
-            remote = numverify(result["number"], key)
-            result = {"offline": result, "numverify": remote}
-            if "error" not in remote:
-                result["agree"] = compare(result["offline"], remote)
-        print(json.dumps(result, indent=indent, ensure_ascii=False))
+        print_dorks(numbers)
+    else:
+        print_lookups(numbers, key, indent=2 if args.pretty else None)
     return 0
 
 

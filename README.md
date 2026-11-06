@@ -9,6 +9,11 @@ number.
     python3 -m venv .venv
     .venv/bin/pip install -r requirements.txt
 
+Run the tests (standard library only; they use libphonenumber's example
+numbers, never real ones):
+
+    .venv/bin/python -m unittest discover -s tests
+
 ## Usage
 
 Numbers must include the country code (`91…` for India, `1…` for US).
