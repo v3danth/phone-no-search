@@ -16,6 +16,7 @@ import argparse
 import csv
 import json
 import os
+import re
 import sys
 from functools import lru_cache
 from pathlib import Path
@@ -28,6 +29,14 @@ from phonenumbers import PhoneNumberFormat, PhoneNumberType, carrier, geocoder
 
 ROOT = Path(__file__).resolve().parent
 SERIES_CSV = ROOT / "data" / "in_mobile_series.csv"
+BLOCKS_CSV = ROOT / "data" / "in_mobile_blocks.csv"
+MSC_CSV = ROOT / "data" / "in_mobile_msc.csv"
+LIBPN_CSV = ROOT / "data" / "in_libphonenumber_history.csv"
+# Dated histories of the two 4-digit sources (scripts/series_history.py).
+SERIES_HISTORY_CSV = {
+    "wikipedia": ROOT / "data" / "wiki_series_history.csv",
+    "in-mob-prefix": ROOT / "data" / "in_mob_prefix_history.csv",
+}
 # The numverify free plan only supports plain HTTP; paid plans can set
 # NUMVERIFY_URL=https://apilayer.net/api/validate
 NUMVERIFY_URL = "http://apilayer.net/api/validate"
@@ -51,6 +60,26 @@ IN_OPERATORS = {
     "RJ": "Reliance Jio",
     "VI": "Vodafone Idea (Vi)",
     "CG": "BSNL/MTNL",
+}
+
+# Licensees in old DoT letters that no longer run a mobile network. Their
+# numbers were ported out or taken over, so they are never the final answer
+# while a current-operator source has the prefix.
+IN_FORMER_OPERATORS = {
+    "Aircel": "Aircel (closed 2018)",
+    "Dishnet": "Aircel/Dishnet (closed 2018)",
+    "RCom": "Reliance Communications (closed 2017)",
+    "MTS": "MTS/Sistema (merged into RCom 2017)",
+    "Tata": "Tata Teleservices (merged into Airtel 2019)",
+    "Uninor": "Uninor/Telenor (merged into Airtel 2018)",
+    "Videocon": "Videocon (closed 2016)",
+    "Loop": "Loop Mobile (closed 2014)",
+    "S Tel": "S Tel (closed 2012)",
+    "Etisalat": "Etisalat DB (closed 2012)",
+    "Allianze": "Allianz Infratech (licence cancelled 2012)",
+    "HFCL": "HFCL/Quadrant (closed 2016)",
+    "BTA Cellcom": "BTA Cellcom",
+    "RingCentral": "RingCentral (internet telephony)",
 }
 
 IN_CIRCLES = {
@@ -90,61 +119,280 @@ def expand_codes(codes: str, names: dict) -> str:
     return " / ".join(names[c] for c in codes.split("/") if c in names)
 
 
-@lru_cache(maxsize=1)
-def series_table() -> dict:
-    """Map each 4-digit Indian mobile prefix to (operator, circle, source).
+def read_table(path: Path, key: str) -> dict:
+    """Map each row's `key` column to the whole row.
 
-    Cached because every Indian lookup needs it and the CSV never changes
-    while the process runs. A missing file yields an empty table so the
-    tool still works on libphonenumber data alone.
+    A missing file yields an empty table so the tool still works on
+    libphonenumber data alone.
     """
     try:
-        with SERIES_CSV.open(encoding="utf-8") as fh:
-            return {
-                row["series"]: (row["operator"], row["circle"], row["source"])
-                for row in csv.DictReader(fh)
-            }
+        with path.open(encoding="utf-8", newline="") as fh:
+            return {row[key]: row for row in csv.DictReader(fh)}
     except FileNotFoundError:
         return {}
 
 
-def india_mobile_series(national: str) -> dict:
-    """Return carrier, location and source for a 10-digit Indian mobile.
+@lru_cache(maxsize=1)
+def series_table() -> dict:
+    """4-digit prefix -> DoT allocation row. Cached: the CSV never changes
+    while the process runs."""
+    return read_table(SERIES_CSV, "series")
 
-    libphonenumber has no state data for Indian mobiles, so this fills the
-    gap from the series table. Returns {} when the number is not a mobile
-    or its prefix is not in the table.
+
+@lru_cache(maxsize=1)
+def block_table() -> dict:
+    """4- or 5-digit prefix -> newer row (a DoT letter or a live check) that
+    supersedes the series table."""
+    return read_table(BLOCKS_CSV, "prefix")
+
+
+@lru_cache(maxsize=1)
+def msc_table() -> dict:
+    """5-digit block -> every DoT letter row for it, oldest first.
+
+    Unlike the other tables a block can have many rows: DoT reuses blocks,
+    and corrigenda move them between operators and circles.
+    """
+    table = {}
+    try:
+        with MSC_CSV.open(encoding="utf-8", newline="") as fh:
+            for row in csv.DictReader(fh):
+                table.setdefault(row["block"], []).append(row)
+    except FileNotFoundError:
+        return {}
+    for rows in table.values():
+        rows.sort(key=lambda row: row["date"])
+    return table
+
+
+def series_entry(row: dict) -> dict:
+    """Spell out one series or blocks-file row as a history entry."""
+    return {
+        "carrier": expand_codes(row["operator"], IN_OPERATORS),
+        "location": expand_codes(row["circle"], IN_CIRCLES),
+        "source": row["source"],
+        "updated": row.get("updated", ""),
+    }
+
+
+def msc_entry(row: dict) -> dict:
+    """Spell out one DoT letter row as a history entry."""
+    code = row["operator"]
+    return {
+        "carrier": IN_OPERATORS.get(code) or IN_FORMER_OPERATORS.get(code, code),
+        "location": expand_codes(row["circle"], IN_CIRCLES),
+        "source": "dot.gov.in",
+        "updated": row["date"],
+        "kind": row["kind"],
+        "letter": row["letter"],
+    }
+
+
+def is_current(entry: dict) -> bool:
+    """True when an entry names an operator that still runs a network."""
+    return (entry.get("kind") not in ("withdrawal", "removed", "superseded")
+            and entry["carrier"] in IN_OPERATORS.values())
+
+
+# Every spelling libphonenumber has used for an Indian carrier since 2013,
+# mapped to the operator codes used elsewhere.
+LIBPN_OPERATORS = {
+    "Airtel": "AT", "AirTel": "AT", "AIRTEL": "AT", "Hexacom": "AT",
+    "Bharti Hexacom": "AT",
+    "Reliance Jio": "RJ",
+    "Idea": "VI", "IDEA": "VI", "Idea Cellular Ltd": "VI", "Vodafone": "VI",
+    "Vodafone IN": "VI", "VODAFONE": "VI",
+    "CellOne": "CG", "Cellone": "CG", "BSNL MOBILE": "CG", "BSNL": "CG",
+    "BSNL Mobile": "CG", "MTNL": "CG", "DOLPHIN": "CG",
+    "Reliance": "RCom", "RELIANCE": "RCom",
+    "Aircel": "Aircel", "AIRCEL": "Aircel",
+    "Dishnet": "Dishnet", "Dishnet Wireless": "Dishnet",
+    "Tata Docomo": "Tata", "TATA DOCOMO": "Tata", "TATA": "Tata", "Tata": "Tata",
+    "Telewings": "Uninor", "Telenor": "Uninor", "Uninor": "Uninor", "UNITECH": "Uninor",
+    "Sistema": "MTS", "SISTEMA": "MTS",
+    "Videocon": "Videocon", "VIDEOCON": "Videocon", "Videocon Datacom": "Videocon",
+    "Loop Mobile": "Loop",
+    "ETISALAT": "Etisalat", "Etisalat DB(cheers)": "Etisalat",
+    "S TEL": "S Tel", "S Tel": "S Tel",
+}
+
+
+def operator_name(code: str) -> str:
+    """Spell out an operator code, current or closed."""
+    return IN_OPERATORS.get(code) or IN_FORMER_OPERATORS.get(code, code)
+
+
+@lru_cache(maxsize=1)
+def libpn_table() -> dict:
+    """Prefix -> libphonenumber carrier periods (since/until dates), built
+    from its git history by scripts/libphonenumber_history.py."""
+    table = {}
+    try:
+        with LIBPN_CSV.open(encoding="utf-8", newline="") as fh:
+            for row in csv.DictReader(fh):
+                table.setdefault(row["prefix"], []).append(row)
+    except FileNotFoundError:
+        return {}
+    return table
+
+
+def libphonenumber_entries(national: str) -> list:
+    """Return dated entries for each change in libphonenumber's carrier for
+    this number.
+
+    libphonenumber uses the longest prefix it lists, and its prefixes went
+    from 4 to 5 digits over the years, so the carrier on each date is the
+    longest period active then. An entry is added only when the operator
+    changes (spelling changes are ignored). A prefix dropped from the data
+    gives a "removed" entry, which is never the answer. No circle.
+    """
+    table = libpn_table()
+    periods = [row for n in range(1, len(national) + 1)
+               for row in table.get(national[:n], [])]
+    days = sorted({row["since"] for row in periods} | {row["until"] for row in periods} - {""})
+    entries, previous = [], None
+    for day in days:
+        active = [row for row in periods
+                  if row["since"] <= day and (not row["until"] or day < row["until"])]
+        row = max(active, key=lambda r: len(r["prefix"])) if active else None
+        code = LIBPN_OPERATORS.get(row["carrier"], row["carrier"]) if row else None
+        if code == previous:
+            continue
+        if row:
+            entries.append({"carrier": operator_name(code), "location": "",
+                            "source": "libphonenumber", "updated": day,
+                            "kind": "listed", "prefix": row["prefix"],
+                            "commit": row["since_commit"] if row["since"] == day
+                            else row["until_commit"]})
+        elif previous:
+            entries.append({"carrier": operator_name(previous), "location": "",
+                            "source": "libphonenumber", "updated": day,
+                            "kind": "removed", "prefix": "", "commit": ""})
+        previous = code
+    return entries
+
+
+@lru_cache(maxsize=None)
+def series_history(source: str) -> dict:
+    """Prefix -> dated (operator, circle) periods for a 4-digit source."""
+    path = SERIES_HISTORY_CSV.get(source)
+    table = {}
+    try:
+        with path.open(encoding="utf-8", newline="") as fh:
+            for row in csv.DictReader(fh):
+                table.setdefault(row["prefix"], []).append(row)
+    except (AttributeError, FileNotFoundError):
+        return {}
+    return table
+
+
+def operator_names(codes: str) -> str:
+    """Spell out "AT/Aircel"-style operator codes, current or closed."""
+    return " / ".join(operator_name(code) for code in codes.split("/") if code)
+
+
+def series_entries(series: dict) -> list:
+    """The 4-digit row as history: its source's earlier values, then the
+    current one dated from when that value first appeared.
+
+    Earlier values are "superseded" and never the answer. Without a
+    history file the row keeps its fetch date.
+    """
+    current = series_entry(series)
+    earlier = []
+    for period in series_history(series["source"]).get(series["series"], []):
+        if not period["until"]:
+            current["updated"] = period["since"]
+            continue
+        earlier.append({"carrier": operator_names(period["operator"]),
+                        "location": expand_codes(period["circle"], IN_CIRCLES),
+                        "source": series["source"], "updated": period["since"],
+                        "kind": "superseded", "until": period["until"]})
+    return earlier + [current]
+
+
+def india_mobile_history(national: str) -> list:
+    """Return what the sources know about a 10-digit Indian mobile, with
+    the entry to trust last.
+
+    Dated entries (DoT letters, libphonenumber's git history, blocks-file
+    rows) are sorted by date, so a reused or corrected block ends on its
+    newest owner. The coarser 4-digit series row (with its source's earlier
+    values, oldest first) goes first as the baseline whatever its date, or last when the newest dated entry is a closed operator, a
+    withdrawal or a removal and the series row names a current operator,
+    because it names who serves those numbers now.
+
+    Returns [] when the number is not a mobile or no source has it.
     """
     if len(national) != 10 or national[0] not in "6789":
-        return {}
-    match = series_table().get(national[:4])
-    if not match:
-        return {}
-    operator, circle, source = match
-    return {
-        "carrier": expand_codes(operator, IN_OPERATORS),
-        "location": expand_codes(circle, IN_CIRCLES),
-        "series_source": source,
-    }
+        return []
+    blocks = block_table()
+    dated = [msc_entry(row) for row in msc_table().get(national[:5], [])]
+    dated += libphonenumber_entries(national)
+    dated += [series_entry(row)
+              for row in (blocks.get(national[:4]), blocks.get(national[:5])) if row]
+    dated.sort(key=lambda entry: entry["updated"])
+    series = series_table().get(national[:4])
+    undated = series_entries(series) if series else []
+    if dated and not is_current(dated[-1]) and any(map(is_current, undated)):
+        return dated + undated
+    return undated + dated
+
+
+def latest_location(history: list) -> str:
+    """The newest circle given for the answer's operator, or "".
+
+    libphonenumber names a carrier but no circle; another source that
+    names the same operator supplies it. A circle from a different
+    operator's allocation is not used.
+    """
+    answer = history[-1]
+    for entry in reversed(history):
+        if entry["carrier"] == answer["carrier"] and entry["location"] \
+                and entry.get("kind") not in ("withdrawal", "removed", "superseded"):
+            return entry["location"]
+    return ""
 
 
 def india_overrides(result: dict, national: str) -> dict:
     """Return the fields that replace libphonenumber's answer for India.
 
-    The series table is more specific than libphonenumber for Indian
-    mobiles, and stops 7x/8x mobiles being geocoded as STD landlines.
+    The sources are more specific than libphonenumber's geocoder, which
+    reads 7x/8x mobiles as STD landlines; so when the chosen entry has no
+    circle the location is just the country. The newest entry wins; when
+    sources differ, all of them are kept under "history".
     """
-    series = india_mobile_series(national)
-    if series:
-        return {
+    history = india_mobile_history(national)
+    if history:
+        latest = history[-1]
+        fields = {
             "line_type": "mobile",
-            "location": series["location"] or result["location"],
-            "carrier": series["carrier"] or result["carrier"],
-            "series_source": series["series_source"],
+            "location": latest_location(history) or result["country_name"],
+            "carrier": latest["carrier"] or result["carrier"],
+            "series_source": latest["source"],
+            "updated": latest["updated"],
         }
+        if len(history) > 1:
+            fields["history"] = history
+        return fields
+    if result["line_type"] == "mobile":
+        return {"note": unallocated_note(national)}
     if result["line_type"] == "landline_or_mobile":
         return {"location": result["country_name"]}
     return {}
+
+
+def unallocated_note(national: str) -> str:
+    """Explain a valid mobile number that no source gives an operator.
+
+    The 6x series (opened 2017) and 71xx (first letters 2026) are mostly
+    not handed out yet; numverify and Veriphone also return no carrier
+    there (checked 66980, 64460, 66666, 71679 on 2026-11-06).
+    """
+    if national[0] == "6" or national[:2] == "71":
+        return ("no operator in DoT letters, libphonenumber or numverify; "
+                "this block is probably not allocated yet")
+    return "no operator known for this block"
 
 
 def parse_number(raw: str) -> phonenumbers.PhoneNumber:
@@ -233,8 +481,12 @@ def numverify(number: str, key: str) -> dict:
 
 
 def normalized(value) -> str:
-    """Lower-cased text, with None and "" treated alike."""
-    return str(value or "").lower()
+    """Lower-cased words without punctuation, with None and "" alike.
+
+    numverify writes "Uttar Pradesh East" where we write "Uttar Pradesh
+    (East)"; both should compare equal.
+    """
+    return " ".join(re.findall(r"[a-z0-9]+", str(value or "").lower()))
 
 
 def agreement(ours: dict, theirs: dict) -> dict:

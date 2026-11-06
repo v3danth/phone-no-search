@@ -31,7 +31,23 @@ Example output:
      "international_format": "+919738XXXXXX", "country_prefix": "+91",
      "country_code": "IN", "country_name": "India", "location": "Karnataka",
      "carrier": "Vodafone Idea (Vi)", "line_type": "mobile",
-     "series_source": "in-mob-prefix"}
+     "series_source": "in-mob-prefix", "updated": "2026-11-06"}
+
+`updated` is the date behind the answer: the DoT letter date for
+`dot.gov.in`, the check date for `numverify`, the fetch date for the
+4-digit tables. When more than one source covers the number, `history`
+lists every entry (oldest letter first, the one used last), each with its
+own `source` and `updated`; DoT entries also give `kind` (allocation,
+corrigendum, withdrawal) and the `letter` URL. Example, a block DoT has
+reused twice:
+
+    "history": [
+      {"carrier": "Reliance Jio", "location": "Odisha", "source": "wikipedia", ...},
+      {"carrier": "Reliance Communications (closed 2017)", "location": "Bihar & Jharkhand",
+       "source": "dot.gov.in", "updated": "2012-05-16", ...},
+      {"carrier": "Reliance Jio", "location": "Odisha", "source": "dot.gov.in", "updated": "2017-08-23", ...},
+      {"carrier": "Bharti Airtel", "location": "Assam", "source": "dot.gov.in", "updated": "2026-09-28", ...}
+    ]
 
 `--numverify` also calls the numverify API (1 request per number) and
 prints `{"offline": …, "numverify": …, "agree": {…}}`. The `agree` block
@@ -52,7 +68,7 @@ number (with or without +91, spaces, a leading 0) plus a search URL.
 |---|---|
 | valid, formats, country, line type | Google libphonenumber (`phonenumbers`), which bundles each country's ITU numbering plan |
 | landline location (e.g. Bangalore) | libphonenumber geocoder, from the area (STD) code |
-| Indian mobile state and carrier | `data/in_mobile_series.csv`, the first 4 digits mapped to the DoT allocation (see `data/README.md`) |
+| Indian mobile state and carrier | DoT MSC allocation letters per 5-digit block (`data/in_mobile_msc.csv`), hand-checked rows (`data/in_mobile_blocks.csv`), libphonenumber's carrier data through its git history 2013-2026 (`data/in_libphonenumber_history.csv`, no circle), and the 4-digit series table (`data/in_mobile_series.csv`); newest dated entry wins (see `data/README.md`) |
 | other carriers | libphonenumber carrier data |
 
 For Indian 10-digit numbers starting 6–9 that are in the series table, the
@@ -70,6 +86,7 @@ city.
 | 916362XXXXXX | Karnataka, Jio | Karnataka, Jio |
 | 916363XXXXXX | Karnataka, Jio | Karnataka, Jio |
 | 919886XXXXXX | Karnataka, Vi | Karnataka, Vi |
+| 918317XXXXXX | UP West, Vi (now Karnataka, Jio via block 83174) | Karnataka, Jio |
 | 918306XXXXXX | India, Airtel | Rajasthan, Airtel (prefix not in our data) |
 | 9180XXXXXXXX | Bangalore, Karnataka, landline | Bengaluru, landline |
 | 1650XXXXXXX | California, no carrier | Palo Alto, T-Mobile |
@@ -96,13 +113,22 @@ How commercial verifiers get their data:
   vendors such as IPQS, Seven.io and Loqate. This is the only way to see
   ported numbers.
 
-No public 2025–26 allocation list was found; the newest press coverage is
-from 2022. Wikipedia's per-prefix tables (edited Oct 2025) were the best
-current source.
+DoT's own site search (`https://www.dot.gov.in/search`, "allotment msc
+codes") lists the allocation letters with PDFs, 2007 to Oct 2026; these
+are in `data/dot_msc/`. With libphonenumber's 5-digit carrier data and
+the 4-digit tables, 25,160 of the 40,000 5-digit mobile blocks resolve to
+a current operator (22,856 before libphonenumber was added).
+
+numverify and Veriphone (checked 2026-11-06) are both prefix tables, not
+live lookups. Veriphone's Indian answers are exactly libphonenumber's
+(carrier, "fixed_line_or_mobile", landline-style region), so it adds
+nothing offline. On the 22 blocks numverify answered, this tool's carrier
+matches all 22 without using the numverify rows (18 before
+libphonenumber), and the circle matches 16; the rest show "India".
 
 Possible next steps:
-- Fill the ~1,750 missing prefixes and move to 5-digit precision from DoT
-  and TelecomTalk notices.
+- Fill the remaining ~14,000 blocks with no data; DoT letters listed
+  without a PDF are the main gap.
 - Add a `--country IN` default so bare 10-digit numbers work.
 - Add an optional HLR provider for the current carrier and live status.
 - Add a small web UI.
@@ -142,9 +168,20 @@ maintenance and incident steps.
     phonelookup.py            CLI
     requirements.txt          phonenumbers==9.0.42
     data/in_mobile_series.csv Indian 4-digit series table
+    data/in_mobile_msc.csv    DoT MSC letters, every 5-digit block with date
+    data/in_mobile_blocks.csv hand-checked rows no DoT letter covers
+    data/in_libphonenumber_history.csv  libphonenumber carriers by date
+    data/wiki_series_history.csv        Wikipedia 4-digit table by month, 2009-
+    data/in_mob_prefix_history.csv      in-mob-prefix by commit
+    data/numverify_checks.csv numverify answers for checked blocks
+    data/dot_msc/             the DoT letters (PDF) and their index
     data/README.md            data sources, licence, refresh steps
     scripts/parse_wiki.py     parse the Wikipedia tables into CSV
     scripts/merge.py          merge sources (Wikipedia first)
+    scripts/msc_withdrawals.py add withdrawals implied by DoT corrigenda
+    scripts/libphonenumber_history.py  rebuild libphonenumber history
+    scripts/series_history.py rebuild Wikipedia / in-mob-prefix history
+    scripts/check_blocks.py   check blocks against numverify/Veriphone
 
 ## Sources
 

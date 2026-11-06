@@ -1,0 +1,8 @@
+prefix,operator,circle,source,updated,note
+83174,RJ,KA,numverify,2026-11-06,two numbers in the block checked (both Jio Karnataka); not in any DoT letter on dot.gov.in
+9217,AT,DL,dot.gov.in,2025-10-01,DoT allocation 92170-92179 to Bharti Airtel for Delhi LSA; letter not attached on dot.gov.in
+83173,RJ,KA,numverify,2026-11-06,block check with a made-up number (data/numverify_checks.csv)
+83175,RJ,AP,numverify,2026-11-06,block check with a made-up number (data/numverify_checks.csv)
+83176,RJ,AP,numverify,2026-11-06,block check with a made-up number (data/numverify_checks.csv)
+83177,VI,BR,numverify,2026-11-06,block check with a made-up number (data/numverify_checks.csv)
+83178,VI,WB,numverify,2026-11-06,block check with a made-up number (data/numverify_checks.csv)
