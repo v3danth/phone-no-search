@@ -323,5 +323,167 @@ class MergeTest(unittest.TestCase):
         self.assertEqual(merge.clean_codes("BR/WB/BR/note"), "BR/WB")
 
 
+class ProbeBlockTest(unittest.TestCase):
+    def test_samples_span_the_block_and_are_deterministic(self):
+        self.assertEqual(
+            phonelookup.block_sample_numbers("83170", 3),
+            ["+918317016666", "+918317050000", "+918317083333"])
+        self.assertEqual(
+            phonelookup.block_sample_numbers("83170", 3),
+            phonelookup.block_sample_numbers("83170", 3))
+
+    def test_circle_code_parsed_from_twilio_carrier_string(self):
+        self.assertEqual(
+            phonelookup.twilio_circle_code("Reliance (JIO) - Uttar Pradesh West"), "UW")
+        self.assertEqual(
+            phonelookup.twilio_circle_code(
+                "Airtel India - Tamil Nadu (94) (Bharti Airtel)"), "TN")
+        self.assertEqual(phonelookup.twilio_circle_code("Reliance (JIO)"), "")
+
+    def test_operator_code_matches_twilio_strings(self):
+        self.assertEqual(
+            phonelookup.twilio_operator_code("Airtel India - TN (Bharti Airtel)"),
+            "AT")
+        self.assertEqual(
+            phonelookup.twilio_operator_code("Reliance (JIO) - West Bengal"), "RJ")
+        self.assertEqual(phonelookup.twilio_operator_code("New Telco"), "")
+
+    def test_line_status_is_flattened_or_flagged_absent(self):
+        self.assertEqual(
+            phonelookup.twilio_line_status({"line_status": {"status": "reachable"}}),
+            {"status": "reachable"})
+        self.assertIn("error", phonelookup.twilio_line_status({}))
+        self.assertIn(
+            "error_code 60",
+            phonelookup.twilio_line_status({"line_status": {"error_code": 60}})["error"])
+
+    def test_majority_wins_over_a_ported_in_number(self):
+        mobile = "mobile"
+        live = {
+            "+918317016666": {"valid": True, "carrier": "Reliance (JIO) - KA", "line_type": mobile},
+            "+918317050000": {"valid": True, "carrier": "Reliance (JIO) - KA", "line_type": mobile},
+            "+918317083333": {"valid": True, "carrier": "Airtel India (Bharti)", "line_type": mobile},
+        }
+        with mock.patch.object(phonelookup, "twilio_lookup",
+                               side_effect=lambda e, s, t, f=None: live[e]):
+            result = phonelookup.probe_block("83170", 3, ("S", "T"), {}, False)
+        self.assertEqual(result["majority"], "RJ")
+        self.assertEqual(result["suggested_row"]["operator"], "RJ")
+        self.assertIn("2/3", result["suggested_row"]["note"])
+
+    def test_split_sample_is_inconclusive(self):
+        live = {
+            "+918317025000": {"valid": True, "carrier": "Reliance (JIO)", "line_type": "mobile"},
+            "+918317075000": {"valid": True, "carrier": "Airtel India (Bharti)", "line_type": "mobile"},
+        }
+        with mock.patch.object(phonelookup, "twilio_lookup",
+                               side_effect=lambda e, s, t, f=None: live[e]):
+            result = phonelookup.probe_block("83170", 2, ("S", "T"), {}, False)
+        self.assertEqual(result["majority"], "")
+        self.assertIsNone(result["suggested_row"])
+
+    def test_landline_and_absent_samples_do_not_build_a_mobile_block(self):
+        live = {
+            "+918020016666": {"valid": True, "carrier": "BSNL", "line_type": "landline"},
+            "+918020050000": {"valid": True, "carrier": "BSNL", "line_type": "landline"},
+            "+918020083333": {"valid": False, "carrier": None, "line_type": None},
+        }
+        with mock.patch.object(phonelookup, "twilio_lookup",
+                               side_effect=lambda e, s, t, f=None: live[e]):
+            result = phonelookup.probe_block("80200", 3, ("S", "T"), {}, False)
+        self.assertEqual(result["majority"], "")
+        self.assertIsNone(result["suggested_row"])
+        self.assertEqual(result["outcomes"], {"landline": 2, "absent": 1})
+
+    def test_checks_log_is_idempotent_per_number(self):
+        sample = {"number": "+918317050000", "live_carrier": "Reliance (JIO)",
+                  "live_code": "RJ", "mcc": "405", "mnc": "854",
+                  "line_type": "mobile", "offline_carrier": "", "location": "KA",
+                  "error": None}
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "twilio_checks.csv"
+            with mock.patch.object(phonelookup, "TWILIO_CHECKS_CSV", path):
+                phonelookup.append_twilio_checks([sample])
+                phonelookup.append_twilio_checks([sample])  # re-run must not dupe
+            lines = path.read_text(encoding="utf-8").strip().splitlines()
+        self.assertEqual(len(lines), 2)  # header + one row
+
+
+class TwilioGroundTruthTest(unittest.TestCase):
+    def test_twilio_is_the_current_carrier_and_all_sources_kept(self):
+        fake = {"81234": {"prefix": "81234", "operator": "RJ", "circle": "KA",
+                          "source": "twilio", "updated": "2026-11-07",
+                          "note": "3/3 Reliance Jio"}}
+        with mock.patch.object(phonelookup, "twilio_table", lambda: fake):
+            result = phonelookup.lookup("918123456789")  # block 81234
+        self.assertEqual(result["current_carrier"], "Reliance Jio")
+        self.assertEqual(result["carrier"], "Reliance Jio")
+        self.assertEqual(result["series_source"], "twilio")
+        sources = [h["source"] for h in result["history"]]
+        self.assertEqual(sources[-1], "twilio")          # twilio is the answer
+        self.assertIn("dot.gov.in", sources)             # allocation still kept
+
+    def test_no_twilio_row_leaves_current_carrier_null(self):
+        with mock.patch.object(phonelookup, "twilio_table", lambda: {}):
+            result = phonelookup.lookup("918123456789")
+        self.assertIsNone(result["current_carrier"])
+
+
+class SweepTest(unittest.TestCase):
+    def test_parse_range(self):
+        self.assertEqual(phonelookup.parse_range("70000-79999"), (70000, 79999))
+        with self.assertRaises(ValueError):
+            phonelookup.parse_range("70000")
+
+    def test_budget_cap_stops_before_overspending(self):
+        budget = {"calls": 0, "max": 2}
+        reply = {"valid": True, "carrier": "Jio", "line_type": "mobile"}
+        with mock.patch.object(phonelookup, "twilio_lookup",
+                               side_effect=lambda e, s, t, f=None: dict(reply)):
+            cache = {}
+            phonelookup.billed_lookup("+91a", ("S", "T"), cache, False, "f", budget)
+            phonelookup.billed_lookup("+91b", ("S", "T"), cache, False, "f", budget)
+            with self.assertRaises(phonelookup.BudgetExceeded):
+                phonelookup.billed_lookup("+91c", ("S", "T"), cache, False, "f", budget)
+        self.assertEqual(budget["calls"], 2)
+
+    def test_cache_hit_is_free_and_does_not_count(self):
+        budget = {"calls": 0, "max": 0}  # no billed calls allowed
+        cache = {"+91x": {"carrier": "Jio", "fields": "line_type_intelligence"}}
+        got = phonelookup.billed_lookup("+91x", ("S", "T"), cache, False,
+                                        "line_type_intelligence", budget)
+        self.assertEqual(got["carrier"], "Jio")
+        self.assertEqual(budget["calls"], 0)
+
+    def test_sweep_triages_and_respects_cap(self):
+        # 70000 is live mobile (3 samples), 70001 is landline (1 sample, triaged)
+        def fake(e164, sid, tok, fields=None):
+            if e164.startswith("+917000050") or e164.startswith("+917000016") \
+               or e164.startswith("+917000083"):
+                return {"valid": True, "carrier": "Reliance (JIO)", "line_type": "mobile"}
+            return {"valid": True, "carrier": "BSNL", "line_type": "landline"}
+        saves = []
+        with mock.patch.object(phonelookup, "twilio_lookup", side_effect=fake):
+            results, billed, hit_cap = phonelookup.sweep_blocks(
+                ["70000", "70001"], 3, ("S", "T"), {}, False,
+                "line_type_intelligence", 10, saves.append)
+        self.assertFalse(hit_cap)
+        self.assertEqual(billed, 4)  # 3 for the mobile block + 1 triaged landline
+        self.assertEqual(results[0]["majority"], "RJ")
+        self.assertIsNone(results[1]["suggested_row"])
+
+    def test_suggested_rows_file_is_idempotent_per_prefix(self):
+        row = {"prefix": "70370", "operator": "RJ", "circle": "UW",
+               "source": "twilio", "updated": "2026-11-07", "note": "n"}
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "twilio_suggested.csv"
+            with mock.patch.object(phonelookup, "SUGGESTED_CSV", path):
+                phonelookup.save_suggested_rows([row])
+                phonelookup.save_suggested_rows([{**row, "operator": "AT"}])
+            lines = path.read_text(encoding="utf-8").strip().splitlines()
+        self.assertEqual(len(lines), 2)  # header + one row (updated, not duped)
+        self.assertIn("AT", lines[1])
+
+
 if __name__ == "__main__":
     unittest.main()

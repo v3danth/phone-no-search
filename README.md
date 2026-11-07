@@ -66,6 +66,31 @@ the https endpoint if you are on a paid plan.
     cp .env.example .env    # then fill in NUMVERIFY_KEY
     .venv/bin/python phonelookup.py --numverify --pretty 919738XXXXXX
 
+`--live` calls Twilio Lookup (1 billed request per number) for live HLR
+carrier data and prints `{"offline": …, "live": …}`. Unlike the offline
+tables, which only know the *allocated* operator, the live `carrier` plus
+`mobile_country_code`/`mobile_network_code` show the *current* operator,
+so a ported number (MNP) shows up as a mismatch. Needs `TWILIO_ACCOUNT_SID`
+and `TWILIO_AUTH_TOKEN` in `.env` or the environment. Results are cached to
+`live_cache.json` (git-ignored, since it holds specific real numbers);
+`--refresh` re-queries and overwrites the cache.
+
+    .venv/bin/python phonelookup.py --live --pretty 919738XXXXXX
+
+`--line-status` (with `--live`) also requests Twilio's `line_status` package,
+adding a `line_status` block (`reachable`/`unreachable`/`unknown`: whether the
+handset is currently on and in coverage). It is a gated field billed on top of
+the base lookup; asking for it re-queries a number already cached without it.
+
+`--probe-block` treats its arguments as block prefixes instead of numbers.
+It samples a few numbers per block (`--samples N`, default 3) over Twilio,
+takes the majority carrier, and prints a suggested `in_mobile_blocks.csv`
+row when the sample agrees (a lone ported number is outvoted; a split
+sample is flagged inconclusive). This is current-holder evidence, not a DoT
+allocation. Every sampled number is appended to `data/twilio_checks.csv`.
+
+    .venv/bin/python phonelookup.py --probe-block --samples 3 83170 83171
+
 `--dork` prints a query covering the common written forms of the number
 (with or without +91, spaces, a leading 0) plus a ready-made search URL
 for each engine: Google, Bing, DuckDuckGo, Yandex, Brave, Startpage and
@@ -189,6 +214,7 @@ maintenance and incident steps.
     data/coai_msc.csv         COAI metro-circle MSC listing (undated)
     data/in_mobile_levels_2011.csv  DoT c.2011 all-India MSC levels (Scribd)
     data/numverify_checks.csv numverify answers for checked blocks
+    data/twilio_checks.csv    Twilio HLR answers for --probe-block samples
     data/dot_msc/             the DoT letters (PDF) and their index
     data/README.md            data sources, licence, refresh steps
     scripts/parse_wiki.py     parse the Wikipedia tables into CSV

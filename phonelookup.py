@@ -8,21 +8,31 @@ Usage:
   phonelookup.py --dork 919886XXXXXX     (print a Google search string)
   phonelookup.py --numverify 919886XXXXXX  (also call numverify; needs
                                             NUMVERIFY_KEY in env or .env)
+  phonelookup.py --live 919886XXXXXX       (also call Twilio Lookup for live
+                                            HLR carrier; needs TWILIO_ACCOUNT_SID
+                                            and TWILIO_AUTH_TOKEN in env or .env)
+  phonelookup.py --live --line-status 919886XXXXXX  (add live reachability)
+  phonelookup.py --probe-block 83170 ...   (sample a few numbers per block via
+                                            Twilio to infer its current operator)
 
 Numbers without a leading + are treated as including the country code.
 """
 
 import argparse
+import base64
 import csv
 import json
 import os
 import re
 import sys
+import time
+from collections import Counter
+from datetime import date
 from functools import lru_cache
 from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote_plus, urlencode
-from urllib.request import urlopen
+from urllib.request import Request, urlopen
 
 import phonenumbers
 from phonenumbers import PhoneNumberFormat, PhoneNumberType, carrier, geocoder
@@ -42,6 +52,22 @@ SERIES_HISTORY_CSV = {
 # The numverify free plan only supports plain HTTP; paid plans can set
 # NUMVERIFY_URL=https://apilayer.net/api/validate
 NUMVERIFY_URL = "http://apilayer.net/api/validate"
+
+# Twilio Lookup v2. --live appends the phone number as a path segment.
+# line_type_intelligence is the HLR-backed field: current carrier name,
+# line type, and the serving MCC/MNC (which exposes real MNP porting).
+TWILIO_LOOKUP_URL = "https://lookups.twilio.com/v2/PhoneNumbers"
+
+# --live results are cached here to avoid paying for repeat lookups.
+# This file holds specific real numbers people queried, so it is NOT data
+# to publish: it stays git-ignored, the same as .env.
+LIVE_CACHE = ROOT / "live_cache.json"
+
+# Raw per-number log of --probe-block samples (synthetic block numbers, not
+# real subscribers), mirroring data/numverify_checks.csv. Safe to commit.
+TWILIO_CHECKS_CSV = ROOT / "data" / "twilio_checks.csv"
+# Derived block rows a probe/sweep suggests, in in_mobile_blocks.csv schema.
+SUGGESTED_CSV = ROOT / "data" / "twilio_suggested.csv"
 
 LINE_TYPES = {
     PhoneNumberType.MOBILE: "mobile",
@@ -191,6 +217,32 @@ def msc_entry(row: dict) -> dict:
     }
 
 
+@lru_cache(maxsize=1)
+def twilio_table() -> dict:
+    """5-digit block -> Twilio HLR row (data/twilio_suggested.csv).
+
+    These are live current-carrier observations, treated as ground truth for
+    who holds a block now; the allocation sources stay in history.
+    """
+    return read_table(SUGGESTED_CSV, "prefix")
+
+
+def twilio_entry(row: dict) -> dict:
+    """Spell out a Twilio suggested-block row as a history entry.
+
+    Dated today and marked "current" so it sorts last and becomes the live
+    answer, above every allocation source.
+    """
+    return {
+        "carrier": operator_name(row["operator"]),
+        "location": IN_CIRCLES.get(row["circle"], ""),
+        "source": "twilio",
+        "updated": row.get("updated", ""),
+        "kind": "current",
+        "note": row.get("note", ""),
+    }
+
+
 def is_current(entry: dict) -> bool:
     """True when an entry names an operator that still runs a network."""
     return (entry.get("kind") not in ("withdrawal", "removed", "superseded")
@@ -223,6 +275,61 @@ LIBPN_OPERATORS = {
 def operator_name(code: str) -> str:
     """Spell out an operator code, current or closed."""
     return IN_OPERATORS.get(code) or IN_FORMER_OPERATORS.get(code, code)
+
+
+# Twilio Lookup returns freeform carrier strings such as "Airtel India -
+# Tamil Nadu (94) (Bharti Airtel)" or "Reliance (JIO) - West Bengal", so
+# these are matched as case-insensitive substrings, not exact keys.
+TWILIO_OPERATORS = (
+    ("jio", "RJ"),
+    ("airtel", "AT"),
+    ("bharti", "AT"),
+    ("vodafone", "VI"),
+    ("idea", "VI"),
+    ("bsnl", "CG"),
+    ("mtnl", "CG"),
+)
+
+
+def twilio_operator_code(carrier_name: str) -> str:
+    """Map a Twilio carrier string to our operator code, or "" if unknown."""
+    text = (carrier_name or "").lower()
+    for needle, code in TWILIO_OPERATORS:
+        if needle in text:
+            return code
+    return ""
+
+
+@lru_cache(maxsize=1)
+def circle_by_name() -> dict:
+    """Reverse of IN_CIRCLES: full circle name (lower-case) -> code."""
+    return {name.lower(): code for code, name in IN_CIRCLES.items()}
+
+
+def circle_code(location: str) -> str:
+    """Map an offline location name to a circle code, or "" if unknown."""
+    return circle_by_name().get((location or "").lower(), "")
+
+
+@lru_cache(maxsize=1)
+def circle_by_normalized() -> dict:
+    """IN_CIRCLES keyed by normalized name, so "Uttar Pradesh (West)" and
+    Twilio's "Uttar Pradesh West" both resolve to UW."""
+    return {normalized(name): code for code, name in IN_CIRCLES.items()}
+
+
+def twilio_circle_code(carrier_name: str) -> str:
+    """Pull a circle code out of a Twilio carrier string, or "" if none.
+
+    Twilio writes the circle after " - ", e.g. "Reliance (JIO) - Uttar Pradesh
+    West" or "Airtel India - Tamil Nadu (94) (Bharti Airtel)"; the trailing
+    parenthetical (network code or legal name) is dropped before matching.
+    """
+    text = carrier_name or ""
+    if " - " not in text:
+        return ""
+    region = text.split(" - ", 1)[1].split(" (")[0]
+    return circle_by_normalized().get(normalized(region), "")
 
 
 @lru_cache(maxsize=1)
@@ -395,6 +502,9 @@ def india_mobile_history(national: str) -> list:
     dated += libphonenumber_entries(national)
     dated += [series_entry(row)
               for row in (blocks.get(national[:4]), blocks.get(national[:5])) if row]
+    twilio = twilio_table().get(national[:5])
+    if twilio:  # live ground truth, dated today: sorts last as the answer
+        dated.append(twilio_entry(twilio))
     dated.sort(key=lambda entry: entry["updated"])
     series = series_table().get(national[:4])
     undated = []
@@ -448,12 +558,16 @@ def india_overrides(result: dict, national: str) -> dict:
     history = india_mobile_history(national)
     if history:
         latest = history[-1]
+        from_twilio = latest.get("source") == "twilio"
         fields = {
             "line_type": "mobile",
             "location": latest_location(history) or result["country_name"],
             "carrier": latest["carrier"] or result["carrier"],
-            "current_carrier": None,
-            "carrier_note": "allocation; current may differ (MNP)",
+            "current_carrier": latest["carrier"] if from_twilio else None,
+            "carrier_note": ("current carrier from a Twilio HLR sample (ground "
+                             "truth); see history for the DoT allocation"
+                             if from_twilio
+                             else "allocation; current may differ (MNP)"),
             "series_source": latest["source"],
             "updated": latest["updated"],
         }
@@ -570,6 +684,373 @@ def numverify(number: str, key: str) -> dict:
     return body
 
 
+LTI_FIELD = "line_type_intelligence"
+LINE_STATUS_FIELD = "line_status"
+TWILIO_RETRIES = 4  # attempts per lookup before giving up (429/5xx backoff)
+
+
+def twilio_lookup(e164: str, sid: str, token: str,
+                  fields: str = LTI_FIELD) -> dict:
+    """Call Twilio Lookup v2 for one E.164 number (HLR-backed carrier data).
+
+    `fields` is Twilio's comma-separated package list; the result is flattened
+    to the number facts we use. line_status, when asked for and licensed on
+    the account, adds whether the line is currently active/reachable.
+    Returns {"error": ...} so one bad request does not stop a batch; the
+    credentials are HTTP Basic auth and are never logged.
+    """
+    url = env_setting("TWILIO_LOOKUP_URL") or TWILIO_LOOKUP_URL
+    query = urlencode({"Fields": fields})
+    auth = base64.b64encode(f"{sid}:{token}".encode()).decode()
+    request = Request(
+        f"{url}/{quote_plus(e164)}?{query}",
+        headers={"Authorization": f"Basic {auth}"},
+    )
+    # A long sweep gets rate-limited (429) and transient 5xx/timeouts; back off
+    # and retry a few times so throttling slows the run instead of blanking it.
+    for attempt in range(TWILIO_RETRIES):
+        try:
+            with urlopen(request, timeout=10) as resp:
+                body = json.load(resp)
+            break
+        except HTTPError as err:
+            if err.code in (429, 500, 502, 503, 504) and attempt < TWILIO_RETRIES - 1:
+                time.sleep(2 ** attempt)
+                continue
+            try:
+                detail = json.load(err)
+            except ValueError:
+                return {"error": f"request failed: {err}"}
+            return {"error": detail.get("message") or f"request failed: {err}"}
+        except (URLError, TimeoutError, ValueError) as err:
+            if attempt < TWILIO_RETRIES - 1:
+                time.sleep(2 ** attempt)
+                continue
+            return {"error": f"request failed: {err}"}
+
+    lti = body.get("line_type_intelligence") or {}
+    result = {
+        "valid": body.get("valid"),
+        "number": body.get("phone_number"),
+        "national_format": body.get("national_format"),
+        "country_code": body.get("country_code"),
+        "carrier": lti.get("carrier_name"),
+        "line_type": lti.get("type"),
+        "mobile_country_code": lti.get("mobile_country_code"),
+        "mobile_network_code": lti.get("mobile_network_code"),
+        "fields": fields,
+    }
+    if LINE_STATUS_FIELD in fields:
+        result["line_status"] = twilio_line_status(body)
+    return result
+
+
+def twilio_line_status(body: dict) -> dict:
+    """Flatten a Lookup v2 line_status block, or an error note if absent.
+
+    The field is gated, so Twilio may return it as null or with an error_code
+    even on a 200; record that instead of silently dropping it.
+    """
+    status = body.get("line_status")
+    if not status:
+        return {"error": "line_status not returned (not licensed/available)"}
+    if status.get("error_code"):
+        return {"error": f"line_status error_code {status['error_code']}"}
+    return {"status": status.get("status")}
+
+
+def live_cache_load() -> dict:
+    """Read the git-ignored live-lookup cache, or {} if absent/unreadable."""
+    try:
+        return json.loads(LIVE_CACHE.read_text(encoding="utf-8"))
+    except (FileNotFoundError, ValueError):
+        return {}
+
+
+def live_cache_save(cache: dict) -> None:
+    """Write the live-lookup cache back to disk (best effort)."""
+    try:
+        LIVE_CACHE.write_text(
+            json.dumps(cache, indent=2, ensure_ascii=False), encoding="utf-8")
+    except OSError:
+        pass
+
+
+def cached_twilio_lookup(e164: str, twilio: tuple, cache: dict,
+                         refresh: bool, fields: str = LTI_FIELD) -> dict:
+    """Return a Twilio result for e164, from cache unless refresh is set.
+
+    A fresh call is stored under the E.164 key with a fetched_at date, so a
+    repeat run costs nothing. The cache is reused only when it already covers
+    every requested field; asking for a new field (e.g. live_activity) forces
+    a refetch. Errors are returned but not cached.
+    """
+    cached = cache.get(e164)
+    if not refresh and cached and _covers(cached, fields):
+        return cached
+    result = twilio_lookup(e164, twilio[0], twilio[1], fields)
+    if "error" not in result:
+        result = {**result, "fetched_at": _today()}
+        cache[e164] = result
+    return result
+
+
+def _covers(cached: dict, fields: str) -> bool:
+    """True when a cached result already includes every requested field."""
+    have = (cached.get("fields") or LTI_FIELD).split(",")
+    return all(field in have for field in fields.split(","))
+
+
+def _today() -> str:
+    """Today's date as YYYY-MM-DD (for cache stamps and probe logs)."""
+    return date.today().isoformat()
+
+
+def block_sample_numbers(prefix: str, count: int) -> list:
+    """Pick `count` E.164 numbers spread evenly across an Indian block.
+
+    A block is the leading digits of the 10-digit national number; the rest
+    is filled with suffixes at even offsets so the sample spans the range and
+    is deterministic (a re-run reuses the cache instead of paying again).
+    """
+    suffix_len = 10 - len(prefix)
+    span = 10 ** suffix_len
+    numbers = []
+    for i in range(count):
+        suffix = int((i + 0.5) / count * span)
+        numbers.append(f"+91{prefix}{suffix:0{suffix_len}d}")
+    return numbers
+
+
+def block_note(prefix: str, counts: Counter, total: int) -> str:
+    """Describe a block sample for the CSV note, spelling out any split.
+
+    HLR reports the current (possibly ported) carrier, so the note records
+    this as current-holder evidence, not a DoT allocation.
+    """
+    parts = [f"{n}/{total} {operator_name(code) if code else 'unknown'}"
+             for code, n in counts.most_common()]
+    return (f"{total} numbers sampled via Twilio HLR ({'; '.join(parts)}); "
+            "current-carrier evidence (MNP), not a DoT allocation")
+
+
+def live_outcome(live: dict, ok: bool) -> str:
+    """Classify one live result for the probe summary.
+
+    Separates the reasons a sample does not count toward a mobile block:
+    a failed request, an unallocated number, or a non-mobile line.
+    """
+    if not ok:
+        return "error"
+    if not live.get("valid") or not live.get("carrier"):
+        return "absent"
+    return live.get("line_type") or "unknown"
+
+
+def is_live_mobile(live: dict) -> bool:
+    """True when a live result is a reachable mobile line worth counting."""
+    return ("error" not in live and bool(live.get("valid"))
+            and live.get("line_type") == "mobile")
+
+
+def sample_row(number: str, live: dict) -> dict:
+    """One per-number record: live facts plus the offline carrier/location."""
+    offline = lookup(number)
+    return {
+        "number": number,
+        "live_carrier": live.get("carrier"),
+        "live_code": twilio_operator_code(live.get("carrier", "")) if is_live_mobile(live) else "",
+        "mcc": live.get("mobile_country_code"),
+        "mnc": live.get("mobile_network_code"),
+        "line_type": live.get("line_type"),
+        "offline_carrier": offline.get("carrier"),
+        "location": offline.get("location"),
+        "error": live.get("error"),
+    }
+
+
+def aggregate_block(prefix: str, pairs: list) -> dict:
+    """Turn (number, live) pairs for one block into a probe result.
+
+    Only live mobile lines vote for the operator; a majority (> half the
+    mobile samples) yields a suggested row, otherwise it is inconclusive.
+    """
+    samples, counts, circles, outcomes = [], Counter(), Counter(), Counter()
+    for number, live in pairs:
+        row = sample_row(number, live)
+        if is_live_mobile(live):
+            counts[row["live_code"]] += 1
+            # Prefer the circle Twilio names in the carrier string (present for
+            # gap blocks too); fall back to the offline circle.
+            circle = twilio_circle_code(live.get("carrier", "")) or \
+                circle_code(row["location"] or "")
+            circles[circle] += 1
+        outcomes[live_outcome(live, "error" not in live)] += 1
+        samples.append(row)
+
+    mobile = sum(counts.values())
+    top = counts.most_common(1)
+    majority = top[0][0] if top and top[0][1] * 2 > mobile and top[0][0] else ""
+    circle = circles.most_common(1)[0][0] if circles else ""
+    result = {
+        "prefix": prefix,
+        "samples": samples,
+        "counts": dict(counts),
+        "outcomes": dict(outcomes),
+        "majority": majority,
+        "circle": circle,
+        "suggested_row": None,
+    }
+    if majority:
+        result["suggested_row"] = {
+            "prefix": prefix,
+            "operator": majority,
+            "circle": circle,
+            "source": "twilio",
+            "updated": _today(),
+            "note": block_note(prefix, counts, mobile),
+        }
+    return result
+
+
+def probe_block(prefix: str, count: int, twilio: tuple, cache: dict,
+                refresh: bool) -> dict:
+    """Sample a block over the live API and infer its current operator."""
+    pairs = [(n, cached_twilio_lookup(n, twilio, cache, refresh))
+             for n in block_sample_numbers(prefix, count)]
+    return aggregate_block(prefix, pairs)
+
+
+class BudgetExceeded(Exception):
+    """Raised to stop a sweep cleanly once the billed-call cap is reached."""
+
+
+def blocks_to_refresh(low: int, high: int) -> list:
+    """5-digit mobile blocks in [low, high] a live probe can fill or correct.
+
+    Keeps blocks with no operator (gaps) or a closed operator (stale), and
+    skips blocks already tied to a current operator and non-mobile ranges, so
+    the sweep spends calls only where live data would add something.
+    """
+    dead = {v for k, v in IN_FORMER_OPERATORS.items() if k != "RingCentral"}
+    stale, gaps = [], []
+    for block in range(low, high + 1):
+        result = lookup(f"91{block}50000")
+        if not result.get("valid") or result.get("line_type") != "mobile":
+            continue
+        carrier = result.get("current_carrier") or result.get("carrier") or ""
+        if carrier in dead:  # closed operator: reliably ported, high value
+            stale.append(str(block))
+        elif not carrier:  # gap: often unallocated, so probe these last
+            gaps.append(str(block))
+    return stale + gaps
+
+
+def billed_lookup(e164: str, twilio: tuple, cache: dict, refresh: bool,
+                  fields: str, budget: dict) -> dict:
+    """Cached lookup that counts billed calls and enforces budget['max'].
+
+    A cache hit is free; a real API call increments budget['calls'] and
+    raises BudgetExceeded before exceeding the cap, so a sweep stops without
+    overspending and resumes later from the cache.
+    """
+    cached = cache.get(e164)
+    if not refresh and cached and _covers(cached, fields):
+        return cached
+    if budget["max"] is not None and budget["calls"] >= budget["max"]:
+        raise BudgetExceeded
+    result = twilio_lookup(e164, twilio[0], twilio[1], fields)
+    budget["calls"] += 1
+    if "error" not in result:
+        cache[e164] = {**result, "fetched_at": _today()}
+    return result
+
+
+def sweep_blocks(prefixes: list, samples: int, twilio: tuple, cache: dict,
+                 refresh: bool, fields: str, max_calls, save) -> tuple:
+    """Triage-probe many blocks within a billed-call budget, saving as it goes.
+
+    Each block is checked with one number first; only blocks whose first
+    sample is a live mobile line get the remaining samples, so unallocated and
+    landline blocks cost one call instead of `samples`. The cache is saved
+    every block, so an interrupted or capped run resumes without re-billing.
+    Returns (results, billed_calls, hit_cap).
+    """
+    budget = {"calls": 0, "max": max_calls}
+    results = []
+    hit_cap = False
+    try:
+        for prefix in prefixes:
+            pairs = []
+            for i, number in enumerate(block_sample_numbers(prefix, samples)):
+                live = billed_lookup(number, twilio, cache, refresh, fields, budget)
+                pairs.append((number, live))
+                if i == 0 and not is_live_mobile(live):
+                    break  # triage: do not spend more on a dead/landline block
+            results.append(aggregate_block(prefix, pairs))
+            save(cache)
+    except BudgetExceeded:
+        hit_cap = True
+        save(cache)
+    return results, budget["calls"], hit_cap
+
+
+TWILIO_CHECKS_FIELDS = ["checked", "number", "live_carrier", "live_code",
+                        "mcc", "mnc", "line_type", "offline_carrier",
+                        "location", "error"]
+
+
+def append_twilio_checks(samples: list) -> None:
+    """Record raw per-number probe rows in data/twilio_checks.csv, idempotently.
+
+    Keyed by number so re-running a (cached, unbilled) probe refreshes the row
+    instead of duplicating it. These are synthetic block numbers, not real
+    subscribers, so the log is safe to commit, mirroring numverify_checks.csv.
+    """
+    rows = {}
+    try:
+        with open(TWILIO_CHECKS_CSV, encoding="utf-8", newline="") as fh:
+            rows = {r["number"]: r for r in csv.DictReader(fh)}
+    except FileNotFoundError:
+        pass
+    for sample in samples:
+        rows[sample["number"]] = {"checked": _today(),
+                                  **{k: sample.get(k) for k in TWILIO_CHECKS_FIELDS
+                                     if k != "checked"}}
+    with open(TWILIO_CHECKS_CSV, "w", encoding="utf-8", newline="") as fh:
+        writer = csv.DictWriter(fh, fieldnames=TWILIO_CHECKS_FIELDS,
+                                extrasaction="ignore")
+        writer.writeheader()
+        for number in sorted(rows):
+            writer.writerow(rows[number])
+
+
+SUGGESTED_FIELDS = ["prefix", "operator", "circle", "source", "updated", "note"]
+
+
+def save_suggested_rows(rows: list) -> None:
+    """Merge suggested block rows into data/twilio_suggested.csv, keyed by prefix.
+
+    This file has the in_mobile_blocks.csv schema, so a sweep leaves a ready
+    candidate set to review and merge. Keyed by prefix so resumes and re-runs
+    refresh rows instead of duplicating them.
+    """
+    merged = {}
+    try:
+        with open(SUGGESTED_CSV, encoding="utf-8", newline="") as fh:
+            merged = {r["prefix"]: r for r in csv.DictReader(fh)}
+    except FileNotFoundError:
+        pass
+    for row in rows:
+        merged[row["prefix"]] = row
+    with open(SUGGESTED_CSV, "w", encoding="utf-8", newline="") as fh:
+        writer = csv.DictWriter(fh, fieldnames=SUGGESTED_FIELDS,
+                                extrasaction="ignore")
+        writer.writeheader()
+        for prefix in sorted(merged):
+            writer.writerow(merged[prefix])
+
+
 def normalized(value) -> str:
     """Lower-cased words without punctuation, with None and "" alike.
 
@@ -652,6 +1133,30 @@ def build_parser() -> argparse.ArgumentParser:
                         help="print a search string and a URL per search engine instead")
     parser.add_argument("--numverify", action="store_true",
                         help="also query numverify (uses 1 API request per number)")
+    parser.add_argument("--live", action="store_true",
+                        help="also query Twilio Lookup for live HLR carrier data "
+                             "(needs TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN; "
+                             "1 billed request per number; results cached locally)")
+    parser.add_argument("--refresh", action="store_true",
+                        help="with --live, ignore the cache and re-query Twilio")
+    parser.add_argument("--line-status", action="store_true",
+                        help="with --live, also request Twilio line_status "
+                             "(whether the line is currently active/reachable; "
+                             "gated field, may be unavailable for India)")
+    parser.add_argument("--probe-block", action="store_true",
+                        help="treat positional args as block prefixes: sample a few "
+                             "numbers per block via Twilio to infer its operator "
+                             "(needs Twilio credentials; logs data/twilio_checks.csv)")
+    parser.add_argument("--samples", type=int, default=3, metavar="N",
+                        help="numbers to sample per block with --probe-block (default 3)")
+    parser.add_argument("--probe-range", metavar="LOW-HIGH",
+                        help="sweep every 5-digit mobile block in the range that has "
+                             "no operator or a closed one (e.g. 70000-79999); "
+                             "triages with 1 sample, escalates to --samples on live "
+                             "mobile blocks. Resumable via the cache")
+    parser.add_argument("--max-calls", type=int, metavar="N",
+                        help="hard cap on billed Twilio calls for --probe-range "
+                             "(cache hits are free); stops cleanly and resumes later")
     return parser
 
 
@@ -682,16 +1187,110 @@ def print_dorks(numbers: list) -> None:
             print(f"  {name}: {url}")
 
 
-def print_lookups(numbers: list, key: str, indent) -> None:
-    """Print one JSON result per number, adding numverify when key is set."""
+def print_lookups(numbers: list, key: str, indent, twilio=None,
+                  refresh=False, fields=LTI_FIELD) -> None:
+    """Print one JSON result per number.
+
+    Adds a numverify block when key is set, and a live Twilio Lookup block
+    when twilio=(sid, token) is given. The number stays offline unless a
+    credentialed flag asks for a network call. Live results are cached to a
+    git-ignored file so repeat runs cost nothing (bypass with refresh).
+    """
+    cache = live_cache_load() if twilio else {}
+    dirty = False
     for raw in numbers:
         result = lookup(raw)
-        if key and result["valid"]:
-            remote = numverify(result["number"], key)
-            result = {"offline": result, "numverify": remote}
-            if "error" not in remote:
-                result["agree"] = agreement(result["offline"], remote)
+        offline = result
+        if (key or twilio) and result["valid"]:
+            result = {"offline": offline}
+            if key:
+                remote = numverify(offline["number"], key)
+                result["numverify"] = remote
+                if "error" not in remote:
+                    result["agree"] = agreement(offline, remote)
+            if twilio:
+                e164 = offline["international_format"]
+                before = cache.get(e164)
+                result["live"] = cached_twilio_lookup(
+                    e164, twilio, cache, refresh, fields)
+                dirty = dirty or cache.get(e164) is not before
         print(json.dumps(result, indent=indent, ensure_ascii=False))
+    if dirty:
+        live_cache_save(cache)
+
+
+def print_block_probes(prefixes: list, twilio: tuple, samples: int,
+                       refresh: bool, indent) -> None:
+    """Probe each block prefix and print its inferred operator as JSON.
+
+    Caches live results and appends every sampled number to the checks log,
+    so the paid lookups are recorded once and reused on later runs.
+    """
+    cache = live_cache_load()
+    all_samples = []
+    suggested = []
+    for prefix in prefixes:
+        result = probe_block(prefix, samples, twilio, cache, refresh)
+        all_samples += result["samples"]
+        if result["suggested_row"]:
+            suggested.append(result["suggested_row"])
+        print(json.dumps(result, indent=indent, ensure_ascii=False))
+    live_cache_save(cache)
+    if all_samples:
+        append_twilio_checks(all_samples)
+    if suggested:
+        save_suggested_rows(suggested)
+
+
+def parse_range(text: str) -> tuple:
+    """Parse "LOW-HIGH" into (low, high) ints, or raise ValueError."""
+    low, sep, high = text.partition("-")
+    if not sep:
+        raise ValueError("range must be LOW-HIGH, e.g. 70000-79999")
+    return int(low), int(high)
+
+
+def print_block_sweep(low: int, high: int, twilio: tuple, samples: int,
+                      refresh: bool, fields: str, max_calls, indent) -> None:
+    """Sweep a block range within a billed-call cap, printing suggested rows.
+
+    Prints one JSON line per block that yields a suggested operator row, then
+    a summary (blocks scanned, rows found, calls billed, whether the cap was
+    hit) to stderr. Every sampled number is cached and logged for reuse.
+    """
+    prefixes = blocks_to_refresh(low, high)
+    print(f"{len(prefixes)} blocks worth probing in {low}-{high}; "
+          f"cap {max_calls if max_calls is not None else 'none'} calls",
+          file=sys.stderr)
+    cache = live_cache_load()
+    results, billed, hit_cap = sweep_blocks(
+        prefixes, samples, twilio, cache, refresh, fields, max_calls,
+        live_cache_save)
+
+    suggested = []
+    all_samples = []
+    for result in results:
+        all_samples += result["samples"]
+        if result["suggested_row"]:
+            suggested.append(result["suggested_row"])
+            print(json.dumps(result["suggested_row"], indent=indent,
+                             ensure_ascii=False))
+    if all_samples:
+        append_twilio_checks(all_samples)
+    if suggested:
+        save_suggested_rows(suggested)
+    print(f"done: scanned {len(results)}/{len(prefixes)} blocks, "
+          f"{len(suggested)} rows suggested (saved to {SUGGESTED_CSV.name}), "
+          f"{billed} calls billed"
+          f"{' (CAP HIT, resume to continue)' if hit_cap else ''}",
+          file=sys.stderr)
+
+
+def twilio_creds() -> tuple:
+    """Return (sid, token) from env/.env, or None if either is missing."""
+    sid = env_setting("TWILIO_ACCOUNT_SID")
+    token = env_setting("TWILIO_AUTH_TOKEN")
+    return (sid, token) if sid and token else None
 
 
 def main() -> int:
@@ -706,6 +1305,33 @@ def main() -> int:
                   file=sys.stderr)
             return 2
 
+    twilio = None
+    if args.live or args.probe_block or args.probe_range:
+        twilio = twilio_creds()
+        if not twilio:
+            flag = ("--probe-range" if args.probe_range else
+                    "--probe-block" if args.probe_block else "--live")
+            print(f"{flag} needs TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN "
+                  "in the environment or .env", file=sys.stderr)
+            return 2
+
+    if (args.probe_block or args.probe_range) and args.samples < 1:
+        print("--samples must be at least 1", file=sys.stderr)
+        return 2
+
+    fields = f"{LTI_FIELD},{LINE_STATUS_FIELD}" if args.line_status else LTI_FIELD
+    indent = 2 if args.pretty else None
+
+    if args.probe_range:
+        try:
+            low, high = parse_range(args.probe_range)
+        except ValueError as err:
+            print(f"--probe-range: {err}", file=sys.stderr)
+            return 2
+        print_block_sweep(low, high, twilio, args.samples, args.refresh,
+                          fields, args.max_calls, indent)
+        return 0
+
     try:
         numbers = input_numbers(args)
     except OSError as err:
@@ -715,10 +1341,13 @@ def main() -> int:
         parser.print_help()
         return 2
 
-    if args.dork:
+    if args.probe_block:
+        print_block_probes(numbers, twilio, args.samples, args.refresh, indent)
+    elif args.dork:
         print_dorks(numbers)
     else:
-        print_lookups(numbers, key, indent=2 if args.pretty else None)
+        print_lookups(numbers, key, indent=indent,
+                      twilio=twilio, refresh=args.refresh, fields=fields)
     return 0
 
 
