@@ -33,6 +33,7 @@ BLOCKS_CSV = ROOT / "data" / "in_mobile_blocks.csv"
 MSC_CSV = ROOT / "data" / "in_mobile_msc.csv"
 LIBPN_CSV = ROOT / "data" / "in_libphonenumber_history.csv"
 COAI_CSV = ROOT / "data" / "coai_msc.csv"
+LEVELS2011_CSV = ROOT / "data" / "in_mobile_levels_2011.csv"
 # Dated histories of the two 4-digit sources (scripts/series_history.py).
 SERIES_HISTORY_CSV = {
     "wikipedia": ROOT / "data" / "wiki_series_history.csv",
@@ -75,6 +76,7 @@ IN_FORMER_OPERATORS = {
     "Uninor": "Uninor/Telenor (merged into Airtel 2018)",
     "Videocon": "Videocon (closed 2016)",
     "Loop": "Loop Mobile (closed 2014)",
+    "BPL": "BPL Mobile (merged ~2008)",
     "S Tel": "S Tel (closed 2012)",
     "Etisalat": "Etisalat DB (closed 2012)",
     "Allianze": "Allianz Infratech (licence cancelled 2012)",
@@ -312,6 +314,32 @@ def series_entries(series: dict) -> list:
     return earlier + [current]
 
 
+def extra_series_history(prefix: str, chosen: str) -> list:
+    """Dated periods for a 4-digit prefix from every series-history source
+    except the one the merged series row already uses.
+
+    Both Wikipedia and in-mob-prefix are tracked by commit, but the merged
+    series table keeps one source per prefix, so the other source's history
+    would never show. These entries are informational (an ended period is
+    "superseded", a still-current one "listed"); the chosen source stays
+    the baseline answer.
+    """
+    entries = []
+    for source in SERIES_HISTORY_CSV:
+        if source == chosen:
+            continue
+        for period in series_history(source).get(prefix, []):
+            entries.append({
+                "carrier": operator_names(period["operator"]),
+                "location": expand_codes(period["circle"], IN_CIRCLES),
+                "source": source, "updated": period["since"],
+                "kind": "superseded" if period["until"] else "listed",
+                "until": period["until"],
+            })
+    entries.sort(key=lambda e: e["updated"])
+    return entries
+
+
 @lru_cache(maxsize=1)
 def coai_table() -> dict:
     """5-digit block -> COAI's metro-circle MSC listing (undated, ~2016-17)."""
@@ -325,6 +353,25 @@ def coai_entry(row: dict) -> dict:
             "source": "coai.com", "updated": "", "kind": "listed"}
 
 
+@lru_cache(maxsize=1)
+def levels2011_table() -> dict:
+    """4- or 5-digit level -> the c.2011 DoT "MSC levels" consolidated list.
+
+    A Scribd scan of DoT's all-India "LIST OF MSC & SP CODES ALLOTTED TO
+    ALL" (scripts/parse_levels_2011.py). Undated and stale: every operator
+    on it has since merged or closed, so it is the least-trusted baseline,
+    used mainly for a block's circle when no better source has it.
+    """
+    return read_table(LEVELS2011_CSV, "level")
+
+
+def levels2011_entry(row: dict) -> dict:
+    """Spell out a c.2011 levels-list row as an undated history entry."""
+    return {"carrier": operator_name(row["operator"]),
+            "location": expand_codes(row["circle"], IN_CIRCLES),
+            "source": "scribd-2011", "updated": "", "kind": "listed"}
+
+
 def india_mobile_history(national: str) -> list:
     """Return what the sources know about a 10-digit Indian mobile, with
     the entry to trust last.
@@ -332,8 +379,10 @@ def india_mobile_history(national: str) -> list:
     Dated entries (DoT letters, libphonenumber's git history, blocks-file
     rows) are sorted by date, so a reused or corrected block ends on its
     newest owner. Undated or coarse entries go first as the baseline
-    whatever their date: the 4-digit series row (with its source's earlier
-    values, oldest first), then COAI's undated 5-digit metro listing, or last when the newest dated entry is a closed operator, a
+    whatever their date: the c.2011 Scribd levels list (stalest, least
+    trusted), then both 4-digit git sources (Wikipedia and in-mob-prefix,
+    with their earlier values, oldest first), then COAI's undated 5-digit
+    metro listing, or last when the newest dated entry is a closed operator, a
     withdrawal or a removal and the series row names a current operator,
     because it names who serves those numbers now.
 
@@ -348,7 +397,14 @@ def india_mobile_history(national: str) -> list:
               for row in (blocks.get(national[:4]), blocks.get(national[:5])) if row]
     dated.sort(key=lambda entry: entry["updated"])
     series = series_table().get(national[:4])
-    undated = series_entries(series) if series else []
+    undated = []
+    if series:
+        undated += extra_series_history(national[:4], series["source"])
+        undated += series_entries(series)
+    levels = levels2011_table()
+    old = levels.get(national[:5]) or levels.get(national[:4])
+    if old:  # oldest and stalest, so it is the least-trusted baseline
+        undated.insert(0, levels2011_entry(old))
     coai = coai_table().get(national[:5])
     if coai:  # 5-digit, so it outranks the 4-digit row
         undated.append(coai_entry(coai))
@@ -382,6 +438,12 @@ def india_overrides(result: dict, national: str) -> dict:
     reads 7x/8x mobiles as STD landlines; so when the chosen entry has no
     circle the location is just the country. The newest entry wins; when
     sources differ, all of them are kept under "history".
+
+    `carrier` is the original DoT allocation. After mobile number
+    portability (MNP) the subscriber may have moved to another operator
+    without changing the number, so `current_carrier` is returned as null:
+    the live operator is only knowable from an HLR / number-portability
+    lookup, which this offline tool does not do.
     """
     history = india_mobile_history(national)
     if history:
@@ -390,6 +452,8 @@ def india_overrides(result: dict, national: str) -> dict:
             "line_type": "mobile",
             "location": latest_location(history) or result["country_name"],
             "carrier": latest["carrier"] or result["carrier"],
+            "current_carrier": None,
+            "carrier_note": "allocation; current may differ (MNP)",
             "series_source": latest["source"],
             "updated": latest["updated"],
         }
@@ -534,11 +598,24 @@ def agreement(ours: dict, theirs: dict) -> dict:
     }
 
 
+# Search engines that accept a "a" OR "b" phrase query in a URL parameter.
+SEARCH_ENGINES = {
+    "Google": "https://www.google.com/search?q=",
+    "Bing": "https://www.bing.com/search?q=",
+    "DuckDuckGo": "https://duckduckgo.com/?q=",
+    "Yandex": "https://yandex.com/search/?text=",
+    "Brave": "https://search.brave.com/search?q=",
+    "Startpage": "https://www.startpage.com/sp/search?query=",
+    "Mojeek": "https://www.mojeek.com/search?q=",
+}
+
+
 def dork(raw: str) -> str:
-    """Build a Google query matching the common written forms of one number.
+    """Build a search query matching the common written forms of one number.
 
     The same number is written many ways online, so an exact-phrase search
-    for one form misses most pages.
+    for one form misses most pages. The "a" OR "b" phrase syntax works on
+    every engine in SEARCH_ENGINES.
     """
     num = parse_number(raw)
     cc, nat = str(num.country_code), str(num.national_number)
@@ -560,6 +637,11 @@ def dork(raw: str) -> str:
     return " OR ".join(f'"{f}"' for f in sorted(forms, key=lambda f: (len(f), f)))
 
 
+def dork_urls(query: str) -> dict:
+    """Map each search engine to its URL for the dork query."""
+    return {name: base + quote_plus(query) for name, base in SEARCH_ENGINES.items()}
+
+
 def build_parser() -> argparse.ArgumentParser:
     """Define the command-line flags."""
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
@@ -567,7 +649,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--file", help="file with one number per line")
     parser.add_argument("--pretty", action="store_true", help="indent JSON")
     parser.add_argument("--dork", action="store_true",
-                        help="print a Google search string and URL instead")
+                        help="print a search string and a URL per search engine instead")
     parser.add_argument("--numverify", action="store_true",
                         help="also query numverify (uses 1 API request per number)")
     return parser
@@ -596,7 +678,8 @@ def print_dorks(numbers: list) -> None:
             print(f"{raw}: {err}", file=sys.stderr)
             continue
         print(query)
-        print("https://www.google.com/search?q=" + quote_plus(query))
+        for name, url in dork_urls(query).items():
+            print(f"  {name}: {url}")
 
 
 def print_lookups(numbers: list, key: str, indent) -> None:

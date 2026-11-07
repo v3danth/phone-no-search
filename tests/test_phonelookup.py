@@ -118,6 +118,8 @@ class HistoryTest(unittest.TestCase):
         use_table(self, "BLOCKS_CSV", phonelookup.block_table,
                   "prefix,operator,circle,source,updated,note\n")
         use_table(self, "COAI_CSV", phonelookup.coai_table, "block,operator,circle,listed_as\n")
+        use_table(self, "LEVELS2011_CSV", phonelookup.levels2011_table,
+                  "level,operator,circle\n")
 
     def test_block_override_wins_and_history_keeps_both(self):
         use_table(self, "BLOCKS_CSV", phonelookup.block_table,
@@ -186,6 +188,30 @@ class HistoryTest(unittest.TestCase):
                   "74104,AT,RJ,2015-01-01,withdrawal,u2,\n")
         self.assertEqual(phonelookup.lookup(IN_SERIES)["series_source"], "wikipedia")
 
+    def test_scribd_2011_is_the_stalest_baseline(self):
+        # The c.2011 list names a closed operator and a circle; the series
+        # table (current) must still answer, but the 2011 entry stays in
+        # history as the oldest baseline with its circle.
+        use_table(self, "LEVELS2011_CSV", phonelookup.levels2011_table,
+                  "level,operator,circle\n7410,Tata,WB\n")
+        result = phonelookup.lookup(IN_SERIES)
+        self.assertEqual(result["carrier"], "Vodafone Idea (Vi)")
+        self.assertEqual(result["series_source"], "wikipedia")
+        self.assertEqual(result["history"][0]["source"], "scribd-2011")
+        self.assertEqual(result["history"][0]["location"], "West Bengal")
+
+    def test_scribd_2011_fills_a_block_with_no_other_source(self):
+        # Prefer a 5-digit level over a 4-digit one, and use it as the
+        # answer when nothing else covers the block.
+        use_table(self, "LEVELS2011_CSV", phonelookup.levels2011_table,
+                  "level,operator,circle\n74104,CG,KA\n7410,AT,RJ\n")
+        use_table(self, "SERIES_CSV", phonelookup.series_table,
+                  "series,operator,circle,source,updated\n")
+        result = phonelookup.lookup(IN_SERIES)
+        self.assertEqual(result["carrier"], "BSNL/MTNL")
+        self.assertEqual(result["location"], "Karnataka")
+        self.assertEqual(result["series_source"], "scribd-2011")
+
 
 class AgreementTest(unittest.TestCase):
     def test_partial_location_and_first_word_carrier_match(self):
@@ -213,6 +239,14 @@ class DorkTest(unittest.TestCase):
 
     def test_indian_spaced_form(self):
         self.assertIn('"81234 56789"', phonelookup.dork(IN_MOBILE))
+
+    def test_urls_cover_every_engine_and_encode_the_query(self):
+        query = phonelookup.dork(US_FICTIONAL)
+        urls = phonelookup.dork_urls(query)
+        self.assertEqual(set(urls), set(phonelookup.SEARCH_ENGINES))
+        self.assertIn("duckduckgo.com", urls["DuckDuckGo"])
+        self.assertIn("yandex.com", urls["Yandex"])
+        self.assertTrue(all(" " not in url for url in urls.values()))
 
 
 class SeriesHistoryTest(unittest.TestCase):

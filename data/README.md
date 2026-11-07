@@ -118,14 +118,34 @@ around 2016-17. 1,814 blocks; 125 blocks the page lists under two
 operators or cities are left out. Used as an undated 5-digit source
 (above the 4-digit table, below anything dated), mainly for circles.
 
+## in_mobile_levels_2011.csv
+
+DoT's c.2011 all-India "LIST OF MSC & SP CODES ALLOTTED TO ALL", a
+consolidated table of every operator's 4-digit levels (plus a few 5-digit
+blocks) per circle. Taken from a clean-text Scribd scan (doc 74759473)
+and parsed by `scripts/parse_levels_2011.py`. 1,210 rows (level,
+operator, circle as codes); 3-digit levels and levels that resolve to
+more than one circle are dropped, page-break duplicates removed. Undated
+and every operator on it (Etisalat DB, Unitech/Uninor, S Tel, Loop,
+Datacom/Videocon, RCom, Idea, Vodafone Essar) has since merged or closed,
+which dates it to 2010-2011. Wired in as the stalest, least-trusted
+baseline: it overlaps the other sources on every block (0 new blocks) and
+only adds a c.2011 data point to `history`.
+
+    python3 scripts/parse_levels_2011.py LIST.pdf   # writes data/in_mobile_levels_2011.csv
+
 ## How the sources combine
 
 For each number the lookup collects the dated entries — DoT letter rows,
 libphonenumber's carrier on each date it changed (longest listed prefix,
 spelling changes ignored, a dropped prefix as "removed"), and
 blocks-file rows — sorts them by date, and uses the newest. The undated
-4-digit series row is the baseline; it wins only when the newest dated
-entry is a closed operator, a withdrawal or a removal. libphonenumber
+entries are the baseline, stalest first: the c.2011 levels list, then both
+4-digit git histories (Wikipedia and in-mob-prefix, each prefix's periods
+oldest first — so both sources show even though the merged series table
+keeps only one per prefix), then COAI's 5-digit metro listing. A baseline
+wins only when the newest dated entry is a closed operator, a withdrawal
+or a removal. libphonenumber
 gives no circle, so the location comes from the newest entry of any
 source naming the same operator, or is "India" if there is none. Every entry is
 returned under `history` with its own source and date.

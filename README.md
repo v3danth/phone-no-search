@@ -31,7 +31,14 @@ Example output:
      "international_format": "+919738XXXXXX", "country_prefix": "+91",
      "country_code": "IN", "country_name": "India", "location": "Karnataka",
      "carrier": "Vodafone Idea (Vi)", "line_type": "mobile",
-     "series_source": "in-mob-prefix", "updated": "2026-11-06"}
+     "current_carrier": null, "series_source": "in-mob-prefix",
+     "updated": "2026-11-06"}
+
+For Indian mobiles `carrier` is the **original DoT allocation**. A
+subscriber can keep the number and move to another operator (MNP), so the
+live operator may differ; `current_carrier` is `null` because that is only
+knowable from an HLR / number-portability lookup, which this offline tool
+does not do. A `carrier_note` field says the same in the output.
 
 `updated` is the date behind the answer: the DoT letter date for
 `dot.gov.in`, the check date for `numverify`, the fetch date for the
@@ -59,8 +66,10 @@ the https endpoint if you are on a paid plan.
     cp .env.example .env    # then fill in NUMVERIFY_KEY
     .venv/bin/python phonelookup.py --numverify --pretty 919738XXXXXX
 
-`--dork` prints a Google query covering the common written forms of the
-number (with or without +91, spaces, a leading 0) plus a search URL.
+`--dork` prints a query covering the common written forms of the number
+(with or without +91, spaces, a leading 0) plus a ready-made search URL
+for each engine: Google, Bing, DuckDuckGo, Yandex, Brave, Startpage and
+Mojeek.
 
 ## How it works
 
@@ -68,7 +77,7 @@ number (with or without +91, spaces, a leading 0) plus a search URL.
 |---|---|
 | valid, formats, country, line type | Google libphonenumber (`phonenumbers`), which bundles each country's ITU numbering plan |
 | landline location (e.g. Bangalore) | libphonenumber geocoder, from the area (STD) code |
-| Indian mobile state and carrier | DoT MSC allocation letters per 5-digit block (`data/in_mobile_msc.csv`), hand-checked rows (`data/in_mobile_blocks.csv`), libphonenumber's carrier data through its git history 2013-2026 (`data/in_libphonenumber_history.csv`, no circle), and the 4-digit series table (`data/in_mobile_series.csv`); newest dated entry wins (see `data/README.md`) |
+| Indian mobile state and carrier | DoT MSC allocation letters per 5-digit block (`data/in_mobile_msc.csv`), hand-checked rows (`data/in_mobile_blocks.csv`), libphonenumber's carrier data through its git history 2013-2026 (`data/in_libphonenumber_history.csv`, no circle), the 4-digit series table (`data/in_mobile_series.csv`), and DoT's c.2011 consolidated "MSC levels" list (`data/in_mobile_levels_2011.csv`, the stalest baseline); newest dated entry wins (see `data/README.md`) |
 | other carriers | libphonenumber carrier data |
 
 For Indian 10-digit numbers starting 6–9 that are in the series table, the
@@ -129,15 +138,21 @@ Possible next steps:
   unallocated (6x, 71xx, prefixes that start with an STD code); about 250
   are real gaps. DoT letters listed without a PDF are the main source
   still missing (RTI to DoT Access Services Wing).
-- TODO: add the consolidated DoT "MSC and SP codes" lists on Scribd:
+- DoT's c.2011 all-India "LIST OF MSC & SP CODES ALLOTTED TO ALL" is
+  added (`data/in_mobile_levels_2011.csv`, from Scribd doc 74759473 via
+  `scripts/parse_levels_2011.py`). Its text layer is clean, so a
+  downloaded PDF parses directly. It is undated and every operator on it
+  has since merged or closed, so it is the stalest baseline: it overlaps
+  the existing sources on every block (0 new blocks) and only adds a
+  c.2011 data point to `history`.
+- TODO: the two other consolidated Scribd lists still differ in date:
   as on 30.06.2014 (87 pages,
   https://www.scribd.com/document/340595713/Msc-Code-All-Operator) and
   as on 31.12.2010
   (https://www.scribd.com/doc/53690984/MSC-and-SP-Codes-as-on-31-12-10).
-  Scribd's viewer scrambles the text (font substitution), so do not
-  scrape it: download while signed in with a password (Google SSO
-  failed), or use screenshots of the pages, then extract like the DoT
-  letters into data/in_mobile_msc.csv with the list's date.
+  Their viewers scramble the text (font substitution), so do not scrape
+  them: download while signed in (Google SSO failed), or use screenshots
+  of the pages, then parse like the 2011 list with the list's date.
 - Add a `--country IN` default so bare 10-digit numbers work.
 - Add an optional HLR provider for the current carrier and live status.
 - Add a small web UI.
@@ -172,6 +187,7 @@ maintenance and incident steps.
     data/wiki_series_history.csv        Wikipedia 4-digit table by month, 2009-
     data/in_mob_prefix_history.csv      in-mob-prefix by commit
     data/coai_msc.csv         COAI metro-circle MSC listing (undated)
+    data/in_mobile_levels_2011.csv  DoT c.2011 all-India MSC levels (Scribd)
     data/numverify_checks.csv numverify answers for checked blocks
     data/dot_msc/             the DoT letters (PDF) and their index
     data/README.md            data sources, licence, refresh steps
@@ -181,6 +197,7 @@ maintenance and incident steps.
     scripts/libphonenumber_history.py  rebuild libphonenumber history
     scripts/series_history.py rebuild Wikipedia / in-mob-prefix history
     scripts/coai_msc.py       extract COAI's MSC table
+    scripts/parse_levels_2011.py  parse DoT's c.2011 MSC levels PDF
     scripts/check_blocks.py   check blocks against numverify/Veriphone
 
 ## Sources
@@ -191,6 +208,7 @@ maintenance and incident steps.
 - https://telecomtalk.info/reliance-jio-msc-code-circles/357322
 - https://telecomtalk.info/dot-allocated-msc-codes-to-reliance-jio/496355/
 - https://telecomtalk.info/idea9133-airtel8942-series-new-msc-codes/132898/
+- https://www.scribd.com/doc/74759473/All-India-Mobile-Levels (DoT c.2011 MSC levels)
 - https://ipqs.com/free-hlr-lookup
 - https://seven.io/en/products/number-validation/hlr-lookup/
 - https://www.loqate.com/en-us/phone-validation/product-detail/
