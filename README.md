@@ -1,8 +1,8 @@
 # phone-no-search
 
-Offline phone number lookup that returns numverify-style JSON, with no API
-key, quota or network calls. It also builds a Google search string for a
-number.
+Phone number lookup that returns numverify-style JSON using offline numbering
+data, and also builds a Google search string for a number. Each normal lookup
+also POSTs the valid number to a local JSON service at `http://localhost:8080/flow`.
 
 ## Setup
 
@@ -24,6 +24,13 @@ Without it, `9738XXXXXX` is read as `+973…` (Bahrain).
     .venv/bin/python phonelookup.py --file numbers.txt
     echo 9180XXXXXXXX | .venv/bin/python phonelookup.py
     .venv/bin/python phonelookup.py --dork 919738XXXXXX
+
+Normal lookups include the local service's parsed JSON response in a `flow`
+field. The service must be running at `localhost:8080`; if it is unavailable,
+returns an HTTP error, or sends invalid JSON, the lookup still prints its
+offline result and includes the failure in `flow.error`. This local request
+uses the number in E.164 format (for example, `+919003488880`). No external
+provider is contacted unless `--numverify` or `--live` is used.
 
 Example output:
 
@@ -81,6 +88,28 @@ and `TWILIO_AUTH_TOKEN` in `.env` or the environment. Results are cached to
 adding a `line_status` block (`reachable`/`unreachable`/`unknown`: whether the
 handset is currently on and in coverage). It is a gated field billed on top of
 the base lookup; asking for it re-queries a number already cached without it.
+
+`--sim-swap` and `--call-forwarding` (with `--live`) add Twilio's `sim_swap`
+and `call_forwarding` fields to the live result. Their Twilio response objects
+are included as `sim_swap` and `call_forwarding`; requesting these fields also
+re-queries cached numbers that do not already include them. These are additional
+paid Lookup fields. Call Forwarding is in private beta, requires carrier
+registration/approval, and is currently limited to major UK carriers; Twilio
+returns `null` for unsupported numbers.
+
+    .venv/bin/python phonelookup.py --live --sim-swap --call-forwarding --pretty 919738XXXXXX
+
+To request **all Twilio fields currently supported by this app** in one Lookup
+request per number, combine all three optional-field flags:
+
+    .venv/bin/python phonelookup.py --live --line-status --sim-swap --call-forwarding --pretty 919738XXXXXX
+
+This includes the default `line_type_intelligence` data plus `line_status`,
+`sim_swap`, and `call_forwarding`. “All” means all packages this app currently
+requests; it does not guarantee every package returns data. Availability depends
+on the number, country/carrier coverage, and Twilio account permissions, and
+optional packages may add charges. `--numverify` is a separate provider call,
+not part of this single Twilio request.
 
 `--probe-block` treats its arguments as block prefixes instead of numbers.
 It samples a few numbers per block (`--samples N`, default 3) over Twilio,

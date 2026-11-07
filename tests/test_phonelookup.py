@@ -4,11 +4,14 @@ Every number here is one of libphonenumber's published example numbers or
 a fictional US 555-01xx number, never a real person's number.
 """
 
+import json
 import sys
 import tempfile
 import unittest
+from io import BytesIO
 from unittest import mock
 from pathlib import Path
+from urllib.parse import parse_qs, urlparse
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path[:0] = [str(ROOT), str(ROOT / "scripts")]
@@ -356,6 +359,30 @@ class ProbeBlockTest(unittest.TestCase):
         self.assertIn(
             "error_code 60",
             phonelookup.twilio_line_status({"line_status": {"error_code": 60}})["error"])
+
+    def test_optional_twilio_fields_are_requested_and_returned(self):
+        body = {
+            "valid": True,
+            "phone_number": "+447772000001",
+            "line_type_intelligence": {"carrier_name": "Example carrier"},
+            "sim_swap": {"swapped_period": "PT24H", "error_code": None},
+            "call_forwarding": {"call_forwarding_enabled": True, "error_code": None},
+        }
+        fields = ",".join((
+            phonelookup.LTI_FIELD,
+            phonelookup.SIM_SWAP_FIELD,
+            phonelookup.CALL_FORWARDING_FIELD,
+        ))
+        with mock.patch.object(
+                phonelookup, "urlopen",
+                return_value=BytesIO(json.dumps(body).encode())) as open_url:
+            result = phonelookup.twilio_lookup(
+                "+447772000001", "AC123", "secret", fields)
+
+        request = open_url.call_args.args[0]
+        self.assertEqual(parse_qs(urlparse(request.full_url).query)["Fields"], [fields])
+        self.assertEqual(result["sim_swap"], body["sim_swap"])
+        self.assertEqual(result["call_forwarding"], body["call_forwarding"])
 
     def test_majority_wins_over_a_ported_in_number(self):
         mobile = "mobile"

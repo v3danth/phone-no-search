@@ -58,6 +58,9 @@ NUMVERIFY_URL = "http://apilayer.net/api/validate"
 # line type, and the serving MCC/MNC (which exposes real MNP porting).
 TWILIO_LOOKUP_URL = "https://lookups.twilio.com/v2/PhoneNumbers"
 
+# Local service queried for every valid number in the normal lookup flow.
+FLOW_URL = "http://localhost:8080/flow"
+
 # --live results are cached here to avoid paying for repeat lookups.
 # This file holds specific real numbers people queried, so it is NOT data
 # to publish: it stays git-ignored, the same as .env.
@@ -642,6 +645,25 @@ def lookup(raw: str) -> dict:
     return result
 
 
+def flow_lookup(e164: str) -> object:
+    """POST the number to the local flow service and return its JSON response."""
+    request = Request(
+        FLOW_URL,
+        data=json.dumps({"phone": e164}).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urlopen(request, timeout=10) as resp:
+            return json.load(resp)
+    except HTTPError as err:
+        return {"error": f"flow service returned HTTP {err.code}: {err.reason}"}
+    except (URLError, TimeoutError, OSError) as err:
+        return {"error": f"flow service unavailable: {err}"}
+    except (ValueError, UnicodeError) as err:
+        return {"error": f"flow service returned invalid JSON: {err}"}
+
+
 def env_setting(name: str) -> str:
     """Read a setting from the environment, falling back to ./.env.
 
@@ -686,6 +708,8 @@ def numverify(number: str, key: str) -> dict:
 
 LTI_FIELD = "line_type_intelligence"
 LINE_STATUS_FIELD = "line_status"
+SIM_SWAP_FIELD = "sim_swap"
+CALL_FORWARDING_FIELD = "call_forwarding"
 TWILIO_RETRIES = 4  # attempts per lookup before giving up (429/5xx backoff)
 
 
@@ -694,8 +718,8 @@ def twilio_lookup(e164: str, sid: str, token: str,
     """Call Twilio Lookup v2 for one E.164 number (HLR-backed carrier data).
 
     `fields` is Twilio's comma-separated package list; the result is flattened
-    to the number facts we use. line_status, when asked for and licensed on
-    the account, adds whether the line is currently active/reachable.
+    to the number facts we use. Optional field packages are returned as
+    Twilio-shaped nested objects.
     Returns {"error": ...} so one bad request does not stop a batch; the
     credentials are HTTP Basic auth and are never logged.
     """
@@ -742,6 +766,10 @@ def twilio_lookup(e164: str, sid: str, token: str,
     }
     if LINE_STATUS_FIELD in fields:
         result["line_status"] = twilio_line_status(body)
+    if SIM_SWAP_FIELD in fields:
+        result[SIM_SWAP_FIELD] = body.get(SIM_SWAP_FIELD)
+    if CALL_FORWARDING_FIELD in fields:
+        result[CALL_FORWARDING_FIELD] = body.get(CALL_FORWARDING_FIELD)
     return result
 
 
@@ -1143,6 +1171,12 @@ def build_parser() -> argparse.ArgumentParser:
                         help="with --live, also request Twilio line_status "
                              "(whether the line is currently active/reachable; "
                              "gated field, may be unavailable for India)")
+    parser.add_argument("--sim-swap", action="store_true",
+                        help="with --live, also request Twilio sim_swap "
+                             "(recent SIM change information)")
+    parser.add_argument("--call-forwarding", action="store_true",
+                        help="with --live, also request Twilio call_forwarding "
+                             "(unconditional forwarding status; limited coverage)")
     parser.add_argument("--probe-block", action="store_true",
                         help="treat positional args as block prefixes: sample a few "
                              "numbers per block via Twilio to infer its operator "
@@ -1192,28 +1226,30 @@ def print_lookups(numbers: list, key: str, indent, twilio=None,
     """Print one JSON result per number.
 
     Adds a numverify block when key is set, and a live Twilio Lookup block
-    when twilio=(sid, token) is given. The number stays offline unless a
-    credentialed flag asks for a network call. Live results are cached to a
-    git-ignored file so repeat runs cost nothing (bypass with refresh).
+    when twilio=(sid, token) is given, plus the local flow service response
+    for each valid number. Live Twilio results are cached to a git-ignored
+    file so repeat runs cost nothing (bypass with refresh).
     """
     cache = live_cache_load() if twilio else {}
     dirty = False
     for raw in numbers:
         result = lookup(raw)
         offline = result
-        if (key or twilio) and result["valid"]:
-            result = {"offline": offline}
-            if key:
-                remote = numverify(offline["number"], key)
-                result["numverify"] = remote
-                if "error" not in remote:
-                    result["agree"] = agreement(offline, remote)
-            if twilio:
-                e164 = offline["international_format"]
-                before = cache.get(e164)
-                result["live"] = cached_twilio_lookup(
-                    e164, twilio, cache, refresh, fields)
-                dirty = dirty or cache.get(e164) is not before
+        if result["valid"]:
+            if key or twilio:
+                result = {"offline": offline}
+                if key:
+                    remote = numverify(offline["number"], key)
+                    result["numverify"] = remote
+                    if "error" not in remote:
+                        result["agree"] = agreement(offline, remote)
+                if twilio:
+                    e164 = offline["international_format"]
+                    before = cache.get(e164)
+                    result["live"] = cached_twilio_lookup(
+                        e164, twilio, cache, refresh, fields)
+                    dirty = dirty or cache.get(e164) is not before
+            result["flow"] = flow_lookup(offline["international_format"])
         print(json.dumps(result, indent=indent, ensure_ascii=False))
     if dirty:
         live_cache_save(cache)
@@ -1297,6 +1333,11 @@ def main() -> int:
     parser = build_parser()
     args = parser.parse_args()
 
+    if (args.line_status or args.sim_swap or args.call_forwarding) and not args.live:
+        print("--line-status, --sim-swap and --call-forwarding require --live",
+              file=sys.stderr)
+        return 2
+
     key = ""
     if args.numverify:
         key = env_setting("NUMVERIFY_KEY")
@@ -1319,7 +1360,14 @@ def main() -> int:
         print("--samples must be at least 1", file=sys.stderr)
         return 2
 
-    fields = f"{LTI_FIELD},{LINE_STATUS_FIELD}" if args.line_status else LTI_FIELD
+    requested_fields = [LTI_FIELD]
+    if args.line_status:
+        requested_fields.append(LINE_STATUS_FIELD)
+    if args.sim_swap:
+        requested_fields.append(SIM_SWAP_FIELD)
+    if args.call_forwarding:
+        requested_fields.append(CALL_FORWARDING_FIELD)
+    fields = ",".join(requested_fields)
     indent = 2 if args.pretty else None
 
     if args.probe_range:
