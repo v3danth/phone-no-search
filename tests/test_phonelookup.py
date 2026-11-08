@@ -9,8 +9,9 @@ import sys
 import tempfile
 import unittest
 from io import BytesIO
-from unittest import mock
 from pathlib import Path
+from unittest import mock
+from urllib.error import URLError
 from urllib.parse import parse_qs, urlparse
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -18,6 +19,7 @@ sys.path[:0] = [str(ROOT), str(ROOT / "scripts")]
 
 import merge  # noqa: E402
 import parse_wiki  # noqa: E402
+
 import phonelookup  # noqa: E402
 
 IN_MOBILE = "918123456789"   # libphonenumber example, prefix 8123 only in DoT letters
@@ -39,7 +41,7 @@ class LookupTest(unittest.TestCase):
                          ["wikipedia", "libphonenumber"])
 
     def test_series_table_alone(self):
-        with mock.patch.object(phonelookup, "libphonenumber_entries", return_value=[]):
+        with mock.patch.object(phonelookup.history, "libphonenumber_entries", return_value=[]):
             result = phonelookup.lookup(IN_SERIES)
         self.assertEqual(result["location"], "Rajasthan")
         self.assertEqual(result["carrier"], "Vodafone Idea (Vi)")
@@ -72,16 +74,20 @@ class LookupTest(unittest.TestCase):
 
 
 def use_table(test, attr, cache, text):
-    """Point phonelookup.<attr> at a temp CSV holding `text` for one test."""
-    tmp = tempfile.NamedTemporaryFile("w", suffix=".csv", delete=False)
+    """Point phonelookup.constants.<attr> at a temp CSV holding `text`.
+
+    The loaders read the path from the constants module, so the override lives
+    there; the matching lru_cache is cleared around the test.
+    """
+    tmp = tempfile.NamedTemporaryFile("w", suffix=".csv", delete=False)  # noqa: SIM115
     tmp.write(text)
     tmp.close()
-    original = getattr(phonelookup, attr)
-    setattr(phonelookup, attr, Path(tmp.name))
+    original = getattr(phonelookup.constants, attr)
+    setattr(phonelookup.constants, attr, Path(tmp.name))
     cache.cache_clear()
 
     def restore():
-        setattr(phonelookup, attr, original)
+        setattr(phonelookup.constants, attr, original)
         cache.cache_clear()
         Path(tmp.name).unlink()
     test.addCleanup(restore)
@@ -98,10 +104,11 @@ class UnallocatedTest(unittest.TestCase):
         def neighbours_known(national):
             return [] if national == "9999912345" else known
 
-        with mock.patch.object(phonelookup, "india_mobile_history", return_value=[]):
+        with mock.patch.object(phonelookup.history, "india_mobile_history", return_value=[]):
             six = phonelookup.lookup("916698012345")
             empty_prefix = phonelookup.lookup("919999912345")
-        with mock.patch.object(phonelookup, "india_mobile_history", side_effect=neighbours_known):
+        with mock.patch.object(phonelookup.history, "india_mobile_history",
+                               side_effect=neighbours_known):
             gap = phonelookup.lookup("919999912345")
         self.assertTrue(six["valid"])
         self.assertIn("probably not allocated", six["note"])
@@ -114,7 +121,7 @@ class HistoryTest(unittest.TestCase):
     prefix 7410 is Vi Rajasthan in the series table."""
 
     def setUp(self):
-        patcher = mock.patch.object(phonelookup, "libphonenumber_entries", return_value=[])
+        patcher = mock.patch.object(phonelookup.history, "libphonenumber_entries", return_value=[])
         patcher.start()
         self.addCleanup(patcher.stop)
         use_table(self, "MSC_CSV", phonelookup.msc_table, MSC_HEADER)
@@ -158,7 +165,7 @@ class HistoryTest(unittest.TestCase):
                 "updated": "2017-01-01", "kind": "listed", "prefix": "74104", "commit": "c"}]
         use_table(self, "MSC_CSV", phonelookup.msc_table, MSC_HEADER +
                   "74104,AT,AS,2026-01-01,allocation,u1,\n")
-        with mock.patch.object(phonelookup, "libphonenumber_entries", return_value=lib):
+        with mock.patch.object(phonelookup.history, "libphonenumber_entries", return_value=lib):
             result = phonelookup.lookup(IN_SERIES)
         self.assertEqual((result["carrier"], result["location"]), ("Bharti Airtel", "Assam"))
         self.assertEqual([h["source"] for h in result["history"]],
@@ -169,7 +176,7 @@ class HistoryTest(unittest.TestCase):
                 "updated": "2017-01-01", "kind": "listed", "prefix": "74104", "commit": "c"}]
         use_table(self, "MSC_CSV", phonelookup.msc_table, MSC_HEADER +
                   "74104,AT,AS,2016-01-01,allocation,u1,\n")
-        with mock.patch.object(phonelookup, "libphonenumber_entries", return_value=lib):
+        with mock.patch.object(phonelookup.history, "libphonenumber_entries", return_value=lib):
             result = phonelookup.lookup(IN_SERIES)
         self.assertEqual((result["carrier"], result["location"]), ("Bharti Airtel", "Assam"))
         self.assertEqual(result["series_source"], "libphonenumber")
@@ -254,7 +261,7 @@ class DorkTest(unittest.TestCase):
 
 class SeriesHistoryTest(unittest.TestCase):
     def test_earlier_values_are_superseded_and_current_is_dated(self):
-        tmp = tempfile.NamedTemporaryFile("w", suffix=".csv", delete=False)
+        tmp = tempfile.NamedTemporaryFile("w", suffix=".csv", delete=False)  # noqa: SIM115
         tmp.write("prefix,operator,circle,since,until,since_ref,until_ref\n"
                   "7410,Aircel,RJ,2010-01-01,2015-01-01,1,2\n"
                   "7410,VI,RJ,2015-01-01,,2,\n")
@@ -263,9 +270,10 @@ class SeriesHistoryTest(unittest.TestCase):
         phonelookup.series_history.cache_clear()
         self.addCleanup(phonelookup.series_history.cache_clear)
         with mock.patch.dict(phonelookup.SERIES_HISTORY_CSV, {"wikipedia": Path(tmp.name)}), \
-                mock.patch.object(phonelookup, "libphonenumber_entries", return_value=[]):
+                mock.patch.object(phonelookup.history, "libphonenumber_entries", return_value=[]):
             result = phonelookup.lookup(IN_SERIES)
-        self.assertEqual((result["carrier"], result["updated"]), ("Vodafone Idea (Vi)", "2015-01-01"))
+        self.assertEqual((result["carrier"], result["updated"]),
+                         ("Vodafone Idea (Vi)", "2015-01-01"))
         first = result["history"][0]
         self.assertEqual((first["carrier"], first["kind"], first["until"]),
                          ("Aircel (closed 2018)", "superseded", "2015-01-01"))
@@ -374,7 +382,7 @@ class ProbeBlockTest(unittest.TestCase):
             phonelookup.CALL_FORWARDING_FIELD,
         ))
         with mock.patch.object(
-                phonelookup, "urlopen",
+                phonelookup.providers.twilio, "urlopen",
                 return_value=BytesIO(json.dumps(body).encode())) as open_url:
             result = phonelookup.twilio_lookup(
                 "+447772000001", "AC123", "secret", fields)
@@ -389,9 +397,10 @@ class ProbeBlockTest(unittest.TestCase):
         live = {
             "+918317016666": {"valid": True, "carrier": "Reliance (JIO) - KA", "line_type": mobile},
             "+918317050000": {"valid": True, "carrier": "Reliance (JIO) - KA", "line_type": mobile},
-            "+918317083333": {"valid": True, "carrier": "Airtel India (Bharti)", "line_type": mobile},
+            "+918317083333": {"valid": True, "carrier": "Airtel India (Bharti)",
+                              "line_type": mobile},
         }
-        with mock.patch.object(phonelookup, "twilio_lookup",
+        with mock.patch.object(phonelookup.providers.twilio, "twilio_lookup",
                                side_effect=lambda e, s, t, f=None: live[e]):
             result = phonelookup.probe_block("83170", 3, ("S", "T"), {}, False)
         self.assertEqual(result["majority"], "RJ")
@@ -401,9 +410,10 @@ class ProbeBlockTest(unittest.TestCase):
     def test_split_sample_is_inconclusive(self):
         live = {
             "+918317025000": {"valid": True, "carrier": "Reliance (JIO)", "line_type": "mobile"},
-            "+918317075000": {"valid": True, "carrier": "Airtel India (Bharti)", "line_type": "mobile"},
+            "+918317075000": {"valid": True, "carrier": "Airtel India (Bharti)",
+                              "line_type": "mobile"},
         }
-        with mock.patch.object(phonelookup, "twilio_lookup",
+        with mock.patch.object(phonelookup.providers.twilio, "twilio_lookup",
                                side_effect=lambda e, s, t, f=None: live[e]):
             result = phonelookup.probe_block("83170", 2, ("S", "T"), {}, False)
         self.assertEqual(result["majority"], "")
@@ -415,7 +425,7 @@ class ProbeBlockTest(unittest.TestCase):
             "+918020050000": {"valid": True, "carrier": "BSNL", "line_type": "landline"},
             "+918020083333": {"valid": False, "carrier": None, "line_type": None},
         }
-        with mock.patch.object(phonelookup, "twilio_lookup",
+        with mock.patch.object(phonelookup.providers.twilio, "twilio_lookup",
                                side_effect=lambda e, s, t, f=None: live[e]):
             result = phonelookup.probe_block("80200", 3, ("S", "T"), {}, False)
         self.assertEqual(result["majority"], "")
@@ -429,7 +439,7 @@ class ProbeBlockTest(unittest.TestCase):
                   "error": None}
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "twilio_checks.csv"
-            with mock.patch.object(phonelookup, "TWILIO_CHECKS_CSV", path):
+            with mock.patch.object(phonelookup.constants, "TWILIO_CHECKS_CSV", path):
                 phonelookup.append_twilio_checks([sample])
                 phonelookup.append_twilio_checks([sample])  # re-run must not dupe
             lines = path.read_text(encoding="utf-8").strip().splitlines()
@@ -441,7 +451,7 @@ class TwilioGroundTruthTest(unittest.TestCase):
         fake = {"81234": {"prefix": "81234", "operator": "RJ", "circle": "KA",
                           "source": "twilio", "updated": "2026-11-07",
                           "note": "3/3 Reliance Jio"}}
-        with mock.patch.object(phonelookup, "twilio_table", lambda: fake):
+        with mock.patch.object(phonelookup.tables, "twilio_table", lambda: fake):
             result = phonelookup.lookup("918123456789")  # block 81234
         self.assertEqual(result["current_carrier"], "Reliance Jio")
         self.assertEqual(result["carrier"], "Reliance Jio")
@@ -451,7 +461,7 @@ class TwilioGroundTruthTest(unittest.TestCase):
         self.assertIn("dot.gov.in", sources)             # allocation still kept
 
     def test_no_twilio_row_leaves_current_carrier_null(self):
-        with mock.patch.object(phonelookup, "twilio_table", lambda: {}):
+        with mock.patch.object(phonelookup.tables, "twilio_table", lambda: {}):
             result = phonelookup.lookup("918123456789")
         self.assertIsNone(result["current_carrier"])
 
@@ -465,7 +475,7 @@ class SweepTest(unittest.TestCase):
     def test_budget_cap_stops_before_overspending(self):
         budget = {"calls": 0, "max": 2}
         reply = {"valid": True, "carrier": "Jio", "line_type": "mobile"}
-        with mock.patch.object(phonelookup, "twilio_lookup",
+        with mock.patch.object(phonelookup.providers.twilio, "twilio_lookup",
                                side_effect=lambda e, s, t, f=None: dict(reply)):
             cache = {}
             phonelookup.billed_lookup("+91a", ("S", "T"), cache, False, "f", budget)
@@ -490,7 +500,7 @@ class SweepTest(unittest.TestCase):
                 return {"valid": True, "carrier": "Reliance (JIO)", "line_type": "mobile"}
             return {"valid": True, "carrier": "BSNL", "line_type": "landline"}
         saves = []
-        with mock.patch.object(phonelookup, "twilio_lookup", side_effect=fake):
+        with mock.patch.object(phonelookup.providers.twilio, "twilio_lookup", side_effect=fake):
             results, billed, hit_cap = phonelookup.sweep_blocks(
                 ["70000", "70001"], 3, ("S", "T"), {}, False,
                 "line_type_intelligence", 10, saves.append)
@@ -504,12 +514,107 @@ class SweepTest(unittest.TestCase):
                "source": "twilio", "updated": "2026-11-07", "note": "n"}
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "twilio_suggested.csv"
-            with mock.patch.object(phonelookup, "SUGGESTED_CSV", path):
+            with mock.patch.object(phonelookup.constants, "SUGGESTED_CSV", path):
                 phonelookup.save_suggested_rows([row])
                 phonelookup.save_suggested_rows([{**row, "operator": "AT"}])
             lines = path.read_text(encoding="utf-8").strip().splitlines()
         self.assertEqual(len(lines), 2)  # header + one row (updated, not duped)
         self.assertIn("AT", lines[1])
+
+
+class SpamSignalTest(unittest.TestCase):
+    def test_trai_caller_series_classified(self):
+        self.assertIn("140", phonelookup.caller_category("1409999999"))
+        self.assertIn("1600", phonelookup.caller_category("16001234567"))
+        self.assertEqual(phonelookup.caller_category("9886012345"), "")
+
+    def test_signal_empty_for_plain_mobile_and_non_india(self):
+        self.assertEqual(
+            phonelookup.spam_signal("919886012345", "9886012345", "IN"), {})
+        # 140-style digits outside India must not be flagged as TRAI series
+        self.assertEqual(
+            phonelookup.spam_signal("14155550123", "4155550123", "US"), {})
+
+    def test_lookup_flags_telemarketer_series(self):
+        result = phonelookup.lookup("911409999999")
+        self.assertTrue(result["valid"])
+        self.assertIn("140", result["spam"]["category"])
+
+    def test_local_spam_list_sets_reported_flag(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "spam_numbers.csv"
+            path.write_text("number,source,updated\n"
+                            "919886012345,user-report,2026-11-08\n",
+                            encoding="utf-8")
+            with mock.patch.object(phonelookup.constants, "SPAM_CSV", path):
+                phonelookup.spam_table.cache_clear()
+                signal = phonelookup.spam_signal("919886012345", "9886012345", "IN")
+        phonelookup.spam_table.cache_clear()
+        self.assertTrue(signal["reported_spam"])
+        self.assertEqual(signal["spam_source"], "user-report")
+
+
+class NetworkRegistryTest(unittest.TestCase):
+    def test_resolves_known_code(self):
+        reg = phonelookup.network_registry("310", "260")
+        self.assertEqual(reg["registered_operator"], "T-Mobile")
+        self.assertEqual(reg["mnc"], "260")
+
+    def test_mnc_format_variants_match(self):
+        # The file stores Airtel Karnataka as 404/045; a 2-digit serving MNC
+        # ("45") and the raw 3-digit form must both resolve to it.
+        self.assertIn("Airtel", phonelookup.network_registry("404", "45")["registered_operator"])
+        self.assertIn("Airtel", phonelookup.network_registry("404", "045")["registered_operator"])
+
+    def test_unknown_or_empty_returns_empty(self):
+        self.assertEqual(phonelookup.network_registry("999", "1"), {})
+        self.assertEqual(phonelookup.network_registry("", ""), {})
+        self.assertEqual(phonelookup.network_registry("405", None), {})
+
+    def test_placeholder_mnc_joins_distinct_names(self):
+        reg = phonelookup.network_registry("404", "999")
+        self.assertTrue(reg["registered_operator"])
+
+    def test_india_rows_flagged_historical(self):
+        reg = phonelookup.network_registry("405", "53")
+        self.assertTrue(reg["historical"])
+        self.assertIn("historical", reg["source"])
+        # non-India rows carry no historical flag
+        self.assertNotIn("historical", phonelookup.network_registry("310", "260"))
+
+    def test_missing_file_disables_feature(self):
+        with mock.patch.object(phonelookup.constants, "MCC_MNC_CSV", Path("/no/such/file.csv")):
+            phonelookup.mcc_mnc_table.cache_clear()
+            self.assertEqual(phonelookup.network_registry("310", "260"), {})
+        phonelookup.mcc_mnc_table.cache_clear()
+
+
+class FlowAndRegistryTest(unittest.TestCase):
+    """Presence providers and the offline MCC/MNC registry, without the network."""
+
+    def test_flow_payload_wraps_the_number(self):  # positive
+        self.assertEqual(phonelookup.flow_payload("+918123456789"),
+                         {"phone": "+918123456789"})
+
+    def test_flipkart_posts_number_and_parses_json(self):  # positive
+        body = {"RESPONSE": {"userDetails": {"+918123456789": "VERIFIED"}}}
+        with mock.patch.object(phonelookup.providers.flow, "urlopen",
+                               return_value=BytesIO(json.dumps(body).encode())):
+            result = phonelookup.flipkart_lookup("+918123456789")
+        self.assertEqual(result["RESPONSE"]["userDetails"]["+918123456789"],
+                         "VERIFIED")
+
+    def test_registry_trims_whitespace_and_pads_mnc(self):  # edge
+        reg = phonelookup.network_registry("  404 ", " 45 ")
+        self.assertIn("Airtel", reg["registered_operator"])
+        self.assertTrue(reg["historical"])
+
+    def test_flow_lookup_reports_unreachable_service(self):  # negative
+        with mock.patch.object(phonelookup.providers.flow, "urlopen",
+                               side_effect=URLError("refused")):
+            result = phonelookup.flow_lookup("+918123456789")
+        self.assertIn("error", result)
+        self.assertIn("unavailable", result["error"])
 
 
 if __name__ == "__main__":

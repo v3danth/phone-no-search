@@ -19,11 +19,11 @@ numbers, never real ones):
 Numbers must include the country code (`91…` for India, `1…` for US).
 Without it, `9738XXXXXX` is read as `+973…` (Bahrain).
 
-    .venv/bin/python phonelookup.py 919738XXXXXX
-    .venv/bin/python phonelookup.py --pretty 919738XXXXXX 1650XXXXXXX
-    .venv/bin/python phonelookup.py --file numbers.txt
-    echo 9180XXXXXXXX | .venv/bin/python phonelookup.py
-    .venv/bin/python phonelookup.py --dork 919738XXXXXX
+    .venv/bin/python -m phonelookup 919738XXXXXX
+    .venv/bin/python -m phonelookup --pretty 919738XXXXXX 1650XXXXXXX
+    .venv/bin/python -m phonelookup --file numbers.txt
+    echo 9180XXXXXXXX | .venv/bin/python -m phonelookup
+    .venv/bin/python -m phonelookup --dork 919738XXXXXX
 
 Normal lookups include the local service's parsed JSON response in a `flow`
 field. The service must be running at `localhost:8080`; if it is unavailable,
@@ -71,7 +71,7 @@ plan is HTTP-only, so the key is sent unencrypted; set `NUMVERIFY_URL` to
 the https endpoint if you are on a paid plan.
 
     cp .env.example .env    # then fill in NUMVERIFY_KEY
-    .venv/bin/python phonelookup.py --numverify --pretty 919738XXXXXX
+    .venv/bin/python -m phonelookup --numverify --pretty 919738XXXXXX
 
 `--live` calls Twilio Lookup (1 billed request per number) for live HLR
 carrier data and prints `{"offline": …, "live": …}`. Unlike the offline
@@ -82,12 +82,24 @@ and `TWILIO_AUTH_TOKEN` in `.env` or the environment. Results are cached to
 `live_cache.json` (git-ignored, since it holds specific real numbers);
 `--refresh` re-queries and overwrites the cache.
 
-    .venv/bin/python phonelookup.py --live --pretty 919738XXXXXX
+    .venv/bin/python -m phonelookup --live --pretty 919738XXXXXX
 
 `--line-status` (with `--live`) also requests Twilio's `line_status` package,
 adding a `line_status` block (`reachable`/`unreachable`/`unknown`: whether the
 handset is currently on and in coverage). It is a gated field billed on top of
 the base lookup; asking for it re-queries a number already cached without it.
+
+When a live result reports a serving `mobile_country_code`/`mobile_network_code`,
+the output also gains a `network_registry` block resolved **offline** from a
+bundled community MCC/MNC list (`data/mcc_mnc.csv`, from musalbas/mcc-mnc-table).
+It names the operator that registered that network code — a separate axis from
+the DoT numbering plan. Treat it as a hint, not ground truth: the list lags
+porting and operator mergers, so Twilio's `carrier` remains authoritative. Its
+India (MCC 404/405) rows are all pre-2010 operators, so India hits are tagged
+`"historical": true` with a note saying so; because the list predates Jio and
+the Vi/Airtel consolidations, a *current* Indian number's serving MNC often is
+not listed and the field is simply omitted. The field is also omitted when the
+code is unknown or the file is absent.
 
 `--sim-swap` and `--call-forwarding` (with `--live`) add Twilio's `sim_swap`
 and `call_forwarding` fields to the live result. Their Twilio response objects
@@ -97,12 +109,12 @@ paid Lookup fields. Call Forwarding is in private beta, requires carrier
 registration/approval, and is currently limited to major UK carriers; Twilio
 returns `null` for unsupported numbers.
 
-    .venv/bin/python phonelookup.py --live --sim-swap --call-forwarding --pretty 919738XXXXXX
+    .venv/bin/python -m phonelookup --live --sim-swap --call-forwarding --pretty 919738XXXXXX
 
 To request **all Twilio fields currently supported by this app** in one Lookup
 request per number, combine all three optional-field flags:
 
-    .venv/bin/python phonelookup.py --live --line-status --sim-swap --call-forwarding --pretty 919738XXXXXX
+    .venv/bin/python -m phonelookup --live --line-status --sim-swap --call-forwarding --pretty 919738XXXXXX
 
 This includes the default `line_type_intelligence` data plus `line_status`,
 `sim_swap`, and `call_forwarding`. “All” means all packages this app currently
@@ -118,12 +130,29 @@ row when the sample agrees (a lone ported number is outvoted; a split
 sample is flagged inconclusive). This is current-holder evidence, not a DoT
 allocation. Every sampled number is appended to `data/twilio_checks.csv`.
 
-    .venv/bin/python phonelookup.py --probe-block --samples 3 83170 83171
+    .venv/bin/python -m phonelookup --probe-block --samples 3 83170 83171
 
 `--dork` prints a query covering the common written forms of the number
 (with or without +91, spaces, a leading 0) plus a ready-made search URL
 for each engine: Google, Bing, DuckDuckGo, Yandex, Brave, Startpage and
 Mojeek.
+
+### Spam / caller category
+
+A valid number may also get a `spam` block, built offline (no API, no
+personal data):
+
+- `category` — set when the number is in a TRAI-designated caller series:
+  `140`-series (registered telemarketing / promotional callers) or
+  `1600`-series (transactional / service callers, from 2024). These classify
+  the *kind of caller*, straight from the numbering plan.
+- `reported_spam` — set when the number appears in an optional local list at
+  `data/spam_numbers.csv`. This is a file you supply, not a lookup service; if
+  it is absent the flag is simply never set. Columns: `number` (full, e.g.
+  `919886012345`), `source`, `updated`.
+
+The block is omitted entirely when nothing applies, so ordinary lookups are
+unchanged.
 
 ## How it works
 
@@ -232,7 +261,9 @@ maintenance and incident steps.
 
 ## Files
 
-    phonelookup.py            CLI
+    phonelookup/              package (constants, tables, history, india, core,
+                              dork, providers/, cli)
+    pyproject.toml            packaging, dependency pins, ruff + mypy config
     requirements.txt          phonenumbers==9.0.42
     data/in_mobile_series.csv Indian 4-digit series table
     data/in_mobile_msc.csv    DoT MSC letters, every 5-digit block with date
@@ -244,6 +275,7 @@ maintenance and incident steps.
     data/in_mobile_levels_2011.csv  DoT c.2011 all-India MSC levels (Scribd)
     data/numverify_checks.csv numverify answers for checked blocks
     data/twilio_checks.csv    Twilio HLR answers for --probe-block samples
+    data/spam_numbers.csv     optional local spam-report list (you supply it)
     data/dot_msc/             the DoT letters (PDF) and their index
     data/README.md            data sources, licence, refresh steps
     scripts/parse_wiki.py     parse the Wikipedia tables into CSV
